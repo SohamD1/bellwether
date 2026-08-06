@@ -1,0 +1,25 @@
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Go
+bin/
+coverage.out
+*.prof
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
