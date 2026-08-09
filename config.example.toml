@@ -1,0 +1,11 @@
+# Bellwether is read-only. Never place a private key or wallet seed here.
+http_rpc_url = "https://base-sepolia.example.invalid"
+websocket_rpc_url = "wss://base-sepolia.example.invalid"
+fixture_address = "0x1111111111111111111111111111111111111111"
+
+start_block = 0
+retained_reorg_depth = 64
+backfill_min_range = 10
+backfill_max_range = 1000
+live_queue_size = 128
+flow_window = 100

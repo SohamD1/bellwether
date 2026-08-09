@@ -25,6 +25,17 @@ func eventTopic(name string) base.Hash {
 	return base.Hash(fixtureABI.Events[name].ID)
 }
 
+// FixtureEventTopics returns the topic-zero alternatives emitted by the
+// Bellwether Base Sepolia integration fixture. A fresh slice prevents callers
+// from mutating the decoder's filter contract.
+func FixtureEventTopics() []base.Hash {
+	return []base.Hash{
+		eventTopic("Trade"),
+		eventTopic("LiquidityChanged"),
+		eventTopic("MarketResolved"),
+	}
+}
+
 func decodeTradeABI(log base.Log) (Trade, error) {
 	event := fixtureABI.Events["Trade"]
 	indexed, err := unpackIndexed(event, log.Topics[1:])
