@@ -1,0 +1,58 @@
+{
+  "purpose": "format compatibility only; not a quality claim",
+  "lightgbm_version": "4.7.0",
+  "loader_compatibility": "Go loader normalizes only the v4 header for leaves",
+  "seed": 20260809,
+  "tree_count": 200,
+  "feature_names": [
+    "yes_implied_probability",
+    "recent_trade_flow_imbalance",
+    "liquidity_depth",
+    "seconds_to_resolution",
+    "block_lag"
+  ],
+  "rows": [
+    [
+      0.5,
+      0.0,
+      1000.0,
+      86400.0,
+      0.0
+    ],
+    [
+      0.08,
+      -0.75,
+      25.0,
+      604800.0,
+      12.0
+    ],
+    [
+      0.92,
+      0.8,
+      20000.0,
+      3600.0,
+      2.0
+    ],
+    [
+      0.35,
+      0.3,
+      250.0,
+      0.0,
+      64.0
+    ],
+    [
+      0.7,
+      -0.2,
+      5000.0,
+      1209600.0,
+      7.0
+    ]
+  ],
+  "probabilities": [
+    0.8146847631973793,
+    0.047404329108104874,
+    0.9887143204246429,
+    0.4262713264351976,
+    0.9397570674280499
+  ]
+}
