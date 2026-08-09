@@ -3,6 +3,7 @@ module github.com/SohamD1/bellwether
 go 1.23.0
 
 require (
+	github.com/dmitryikh/leaves v0.0.0-20230708180554-25d19a787328
 	github.com/ethereum/go-ethereum v1.14.12
 	github.com/parquet-go/parquet-go v0.25.1
 	golang.org/x/sys v0.22.0
