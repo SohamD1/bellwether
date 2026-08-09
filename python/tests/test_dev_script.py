@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,3 +37,15 @@ def test_go_files_skips_local_worktrees_and_generated_outputs(tmp_path: Path) ->
         str(Path("internal") / "keep.go"),
         str(Path("service") / "contracts" / "out" / "source.go"),
     ]
+
+
+def test_documented_local_outputs_are_git_ignored() -> None:
+    documented_outputs = (".demo/example.parquet", "config.toml", "training.parquet")
+
+    for output in documented_outputs:
+        result = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", output],
+            cwd=REPO_ROOT,
+            check=False,
+        )
+        assert result.returncode == 0, f"documented local output is not ignored: {output}"

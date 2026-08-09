@@ -7,10 +7,10 @@ It is a data project, not a trading bot. The included Solidity contracts are no-
 ## What is here
 
 - a Go indexer with bounded HTTP backfill, live WebSocket ingestion, finality tracking, and reorg recovery
-- one Go feature engine used for both streaming snapshots and canonical batch replay
+- a Go feature engine with streaming-capable APIs; the runnable CLI invokes it during one-shot export
 - deterministic labeled Parquet export with a content-derived dataset ID
 - a Python experiment command for logistic regression, LightGBM, Brier score, log loss, and calibration
-- in-process LightGBM inference in Go
+- a Go LightGBM inference package and model compatibility checker; no live inference loop yet
 - small Base Sepolia market and commit-reveal fixtures
 
 ## Run it locally
@@ -54,33 +54,32 @@ The repository contains a [Base Sepolia deployment walkthrough](docs/base-sepoli
 ## Architecture
 
 ```text
-Base RPC / WebSocket
-        |
-        v
-  bounded backfill + live heads
-        |
-        v
-  reorg coordinator ---> canonical Go chain store
-                              |
-                              v
-                       Go feature engine
-                       /               \
-                      v                 v
-              live snapshots     labeled Parquet
-                                        |
-                                        v
-                             Python walk-forward run
-                          metrics + calibration + model
-                                        |
-                                        v
-                               Go model inference
+One-shot export (runnable today)
+
+Base HTTP RPC -> bounded backfill -> reorg coordinator -> canonical Go chain store
+                                                            |
+                                                            v
+                                                   Go feature replay
+                                                            |
+                                                            v
+                                                    labeled Parquet
+                                                            |
+                                                            v
+                                                 Python experiment
+                                           metrics + calibration + model
+
+Live indexing (runnable today)
+
+Base HTTP RPC + WebSocket -> reorg coordinator -> canonical Go chain store
+                                                     |
+                                                     `-- stops here today
 ```
 
-Go is the only feature-computation implementation. Python consumes the labeled Parquet; it does not recreate features. Each run records the source SHA, canonical config hash, and dataset snapshot ID.
+Go is the only feature-computation implementation. Its feature and inference packages expose the component APIs needed for streaming composition, but continuous live feature computation and inference serving are not wired into the executable yet. Today, the complete runnable research path is the one-shot export into Python; `bellwether-model-check` only validates that an exported model can be loaded. Python consumes the labeled Parquet and does not recreate features. Each experiment records the source SHA, canonical config hash, and dataset snapshot ID.
 
 ## Reorg guarantee
 
-Every stored block retains its hash and parent hash. When a new head does not build on the current tip, the coordinator finds the common ancestor, rolls back the orphaned branch, and replays the replacement branch. A reorg is accepted only while its ancestor is retained and above the finalized checkpoint. Otherwise Bellwether returns `ErrResyncRequired` without partially changing state.
+Every stored block retains its hash and parent hash. When a new head does not build on the current tip, the coordinator finds the common ancestor, rolls back the orphaned branch, and replays the replacement branch. A reorg is accepted only while its ancestor is retained and at or above the finalized checkpoint. Otherwise Bellwether returns `ErrResyncRequired` without partially changing state.
 
 The core invariant is tested directly: state after an injected reorg must be byte-for-byte identical to a clean replay of the final canonical chain. Reprocessing the same sealed range is also a no-op. Unfinalized rows may still be replaced; finalized history may not.
 
