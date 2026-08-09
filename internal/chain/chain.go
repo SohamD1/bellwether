@@ -23,8 +23,15 @@ type Block struct {
 }
 
 // ErrNotLinear reports a block that neither extends the tip nor is already
-// stored. Resolving one requires a reorg, which the store does not yet do.
+// stored. Resolving one requires a reorg.
 var ErrNotLinear = errors.New("chain: block does not extend tip")
+
+// ErrUnknownAncestor reports a branch that forks below the oldest stored
+// block. Recovering requires a resync from the last finalized block.
+var ErrUnknownAncestor = errors.New("chain: branch forks below stored history")
+
+// ErrBrokenBranch reports a branch whose own blocks do not link.
+var ErrBrokenBranch = errors.New("chain: branch is not linear")
 
 // Store is a gap-free run of blocks in ascending order. It is not safe for
 // concurrent use.
@@ -68,4 +75,48 @@ func (s *Store) Append(b Block) error {
 	}
 	s.blocks = append(s.blocks, b)
 	return nil
+}
+
+// Blocks returns a copy of the stored chain.
+func (s *Store) Blocks() []Block {
+	return append([]Block(nil), s.blocks...)
+}
+
+// Rollback drops every block above height to and returns the dropped blocks in
+// ascending order.
+func (s *Store) Rollback(to uint64) []Block {
+	for i, b := range s.blocks {
+		if b.Number > to {
+			// Copied because the next append reuses this backing array.
+			dropped := append([]Block(nil), s.blocks[i:]...)
+			s.blocks = s.blocks[:i]
+			return dropped
+		}
+	}
+	return nil
+}
+
+// Reorg replaces everything above the common ancestor with branch, which must
+// be linear and ascending, and returns the orphaned blocks. The store is left
+// untouched if branch is rejected.
+func (s *Store) Reorg(branch []Block) ([]Block, error) {
+	if len(branch) == 0 {
+		return nil, nil
+	}
+	head := branch[0]
+	if head.Number == 0 {
+		return nil, ErrUnknownAncestor
+	}
+	ancestor, ok := s.ByNumber(head.Number - 1)
+	if !ok || ancestor.Hash != head.Parent {
+		return nil, ErrUnknownAncestor
+	}
+	for i := 1; i < len(branch); i++ {
+		if prev := branch[i-1]; branch[i].Number != prev.Number+1 || branch[i].Parent != prev.Hash {
+			return nil, ErrBrokenBranch
+		}
+	}
+	dropped := s.Rollback(ancestor.Number)
+	s.blocks = append(s.blocks, branch...)
+	return dropped, nil
 }
