@@ -10,30 +10,135 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SohamD1/bellwether/internal/base"
 	"github.com/SohamD1/bellwether/internal/config"
+	"github.com/SohamD1/bellwether/internal/market"
+	"github.com/SohamD1/bellwether/internal/trainingdata"
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 type cliBackend struct {
 	headerErr error
+	headers   map[uint64]*types.Header
+	latest    *types.Header
+	logs      []types.Log
 }
 
-func (*cliBackend) FilterLogs(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
-	return nil, nil
+func (b *cliBackend) FilterLogs(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
+	if b.headerErr != nil {
+		return nil, b.headerErr
+	}
+	var logs []types.Log
+	for _, log := range b.logs {
+		if query.FromBlock != nil && log.BlockNumber < query.FromBlock.Uint64() {
+			continue
+		}
+		if query.ToBlock != nil && log.BlockNumber > query.ToBlock.Uint64() {
+			continue
+		}
+		logs = append(logs, log)
+	}
+	return logs, nil
 }
 func (*cliBackend) SubscribeFilterLogs(context.Context, ethereum.FilterQuery, chan<- types.Log) (ethereum.Subscription, error) {
 	return nil, nil
 }
-func (b *cliBackend) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
-	return nil, b.headerErr
+func (b *cliBackend) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	if b.headerErr != nil {
+		return nil, b.headerErr
+	}
+	if number == nil {
+		return types.CopyHeader(b.latest), nil
+	}
+	if number.Int64() == rpc.SafeBlockNumber.Int64() || number.Int64() == rpc.FinalizedBlockNumber.Int64() {
+		return types.CopyHeader(b.latest), nil
+	}
+	return types.CopyHeader(b.headers[number.Uint64()]), nil
 }
 func (*cliBackend) SubscribeNewHead(context.Context, chan<- *types.Header) (ethereum.Subscription, error) {
 	return nil, nil
 }
 func (*cliBackend) Close() {}
+
+func TestRunExportBackfillsTrainingDataWithoutWebSocketDial(t *testing.T) {
+	withoutRPCOverrides(t)
+	path := writeRuntimeConfig(t, "https://base.example/rpc", "wss://base.example/ws")
+	outputPath := filepath.Join(t.TempDir(), "training.parquet")
+	backend := exportCLIBackend(t)
+	var dialed []string
+	dial := func(_ context.Context, endpoint string) (base.EthBackend, error) {
+		dialed = append(dialed, endpoint)
+		return backend, nil
+	}
+	stderr := new(bytes.Buffer)
+
+	if err := runWithDial(context.Background(), []string{
+		"-config", path, "-export-training-data", outputPath,
+	}, stderr, dial); err != nil {
+		t.Fatalf("runWithDial export: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "https://base.example/rpc" {
+		t.Fatalf("dialed endpoints = %v, want only HTTP RPC", dialed)
+	}
+	rows, err := trainingdata.ReadParquet(outputPath)
+	if err != nil {
+		t.Fatalf("ReadParquet: %v", err)
+	}
+	if len(rows) != 1 || rows[0].BlockNumber != 1 || rows[0].LogIndex != 2 ||
+		!rows[0].BlockTimestamp.Equal(time.Unix(1_786_291_200, 0).UTC()) {
+		t.Fatalf("exported source position = %#v, want block 1 log 2 at header timestamp", rows)
+	}
+	id, err := trainingdata.ComputeID(rows)
+	if err != nil {
+		t.Fatalf("ComputeID: %v", err)
+	}
+	output := stderr.String()
+	if !strings.Contains(output, id) || !strings.Contains(output, outputPath) {
+		t.Fatalf("export output = %q, want dataset ID %s and path %s", output, id, outputPath)
+	}
+}
+
+func exportCLIBackend(t *testing.T) *cliBackend {
+	t.Helper()
+	address := common.HexToAddress("0x1234567890abcdef1234567890abcdef12345678")
+	marketID := common.Hash{0x42}
+	first := &types.Header{Number: big.NewInt(1), Time: 1_786_291_200, Extra: []byte{1}}
+	second := &types.Header{Number: big.NewInt(2), ParentHash: first.Hash(), Time: 1_786_291_310, Extra: []byte{2}}
+	topics := market.FixtureEventTopics()
+	liquidityData := packEventData(t, []string{"uint256", "uint256", "uint64"}, big.NewInt(40), big.NewInt(60), uint64(1_786_291_300))
+	resolvedData := packEventData(t, []string{"bool"}, true)
+	return &cliBackend{
+		headers: map[uint64]*types.Header{1: first, 2: second},
+		latest:  second,
+		logs: []types.Log{
+			{Address: address, Topics: []common.Hash{common.Hash(topics[1]), marketID}, Data: liquidityData, BlockNumber: 1, BlockHash: first.Hash(), Index: 2},
+			{Address: address, Topics: []common.Hash{common.Hash(topics[2]), marketID}, Data: resolvedData, BlockNumber: 2, BlockHash: second.Hash(), Index: 1},
+		},
+	}
+}
+
+func packEventData(t *testing.T, typeNames []string, values ...any) []byte {
+	t.Helper()
+	arguments := make(abi.Arguments, len(typeNames))
+	for i, name := range typeNames {
+		argumentType, err := abi.NewType(name, "", nil)
+		if err != nil {
+			t.Fatalf("NewType(%s): %v", name, err)
+		}
+		arguments[i] = abi.Argument{Type: argumentType}
+	}
+	data, err := arguments.Pack(values...)
+	if err != nil {
+		t.Fatalf("Pack event data: %v", err)
+	}
+	return data
+}
 
 func TestRunRejectsUnexpectedArgumentsBeforeDialing(t *testing.T) {
 	t.Parallel()

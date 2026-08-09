@@ -17,6 +17,7 @@ import (
 	"github.com/SohamD1/bellwether/internal/config"
 	"github.com/SohamD1/bellwether/internal/indexer"
 	"github.com/SohamD1/bellwether/internal/market"
+	"github.com/SohamD1/bellwether/internal/trainingdata"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
@@ -55,6 +56,7 @@ func runWithDial(ctx context.Context, args []string, stderr io.Writer, dial rpcD
 	flags := flag.NewFlagSet("bellwether", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "config.toml", "path to the Bellwether TOML configuration")
+	exportPath := flags.String("export-training-data", "", "backfill and export labeled training data to this Parquet path")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -87,6 +89,35 @@ func runWithDial(ctx context.Context, args []string, stderr io.Writer, dial rpcD
 	}
 	defer httpClient.Close()
 
+	decoder, err := market.NewDecoder(settings.FixtureAddress)
+	if err != nil {
+		return fmt.Errorf("create fixture decoder: %w", err)
+	}
+	store := new(chain.Store)
+	if *exportPath != "" {
+		coordinator, err := newCoordinator(httpClient, httpClient, decoder, store, settings)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "bellwether: backfilling from block %d for training export\n", settings.StartBlock)
+		if err := coordinator.Backfill(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return safeRPCError("backfill", err, settings.HTTPRPCURL)
+		}
+		rows, err := trainingdata.ProjectCanonical(store, settings.FlowWindow)
+		if err != nil {
+			return fmt.Errorf("project canonical training data: %w", err)
+		}
+		id, err := trainingdata.WriteParquet(*exportPath, rows)
+		if err != nil {
+			return fmt.Errorf("write training data: %w", err)
+		}
+		fmt.Fprintf(stderr, "bellwether: exported dataset %s to %s\n", id, *exportPath)
+		return nil
+	}
+
 	wsRPC, err := dial(ctx, settings.WebSocketRPCURL)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -101,20 +132,7 @@ func runWithDial(ctx context.Context, args []string, stderr io.Writer, dial rpcD
 	}
 	defer wsClient.Close()
 
-	decoder, err := market.NewDecoder(settings.FixtureAddress)
-	if err != nil {
-		return fmt.Errorf("create fixture decoder: %w", err)
-	}
-	store := new(chain.Store)
-	coordinator, err := indexer.NewCoordinator(httpClient, wsClient, decoder, store, indexer.CoordinatorConfig{
-		Address:          settings.FixtureAddress,
-		Topics:           [][]base.Hash{market.FixtureEventTopics()},
-		StartBlock:       settings.StartBlock,
-		RetainedDepth:    settings.RetainedReorgDepth,
-		BackfillMinRange: settings.BackfillMinRange,
-		BackfillMaxRange: settings.BackfillMaxRange,
-		LiveQueueSize:    settings.LiveQueueSize,
-	})
+	coordinator, err := newCoordinator(httpClient, wsClient, decoder, store, settings)
 	if err != nil {
 		return err
 	}
@@ -138,6 +156,18 @@ func runWithDial(ctx context.Context, args []string, stderr io.Writer, dial rpcD
 		return safeRPCError("live indexing", err, settings.HTTPRPCURL, settings.WebSocketRPCURL)
 	}
 	return nil
+}
+
+func newCoordinator(reader indexer.BlockReader, subscriber base.HeadSubscriptionClient, decoder indexer.EventDecoder, store *chain.Store, settings config.Config) (*indexer.Coordinator, error) {
+	return indexer.NewCoordinator(reader, subscriber, decoder, store, indexer.CoordinatorConfig{
+		Address:          settings.FixtureAddress,
+		Topics:           [][]base.Hash{market.FixtureEventTopics()},
+		StartBlock:       settings.StartBlock,
+		RetainedDepth:    settings.RetainedReorgDepth,
+		BackfillMinRange: settings.BackfillMinRange,
+		BackfillMaxRange: settings.BackfillMaxRange,
+		LiveQueueSize:    settings.LiveQueueSize,
+	})
 }
 
 func safeRPCError(operation string, cause error, endpoints ...string) error {

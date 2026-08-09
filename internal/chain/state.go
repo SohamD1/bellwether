@@ -19,8 +19,13 @@ func fold(prev Hash, b Block) Hash {
 	h := sha256.New()
 	h.Write(prev[:])
 	h.Write(b.Hash[:])
+	var position [8]byte
+	binary.BigEndian.PutUint64(position[:], b.Timestamp)
+	h.Write(position[:])
 	var n [4]byte
 	for _, e := range b.Events {
+		binary.BigEndian.PutUint64(position[:], e.LogIndex)
+		h.Write(position[:])
 		binary.BigEndian.PutUint32(n[:], uint32(len(e.Kind)))
 		h.Write(n[:])
 		h.Write([]byte(e.Kind))

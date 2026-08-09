@@ -64,6 +64,28 @@ func TestEventsDropOrphanedBlocks(t *testing.T) {
 	}
 }
 
+func TestCanonicalBlocksPreserveEventPositionsAndTimestamps(t *testing.T) {
+	s := new(Store)
+	block := blk(100, 1, 0)
+	block.Timestamp = 1_786_291_200
+	block.Events = []Event{
+		{Kind: "trade", LogIndex: 2},
+		{Kind: "market_resolved", LogIndex: 7},
+	}
+	appendAll(t, s, []Block{block})
+
+	stored, ok := s.ByNumber(100)
+	if !ok {
+		t.Fatal("ByNumber(100) did not find appended block")
+	}
+	if stored.Timestamp != block.Timestamp {
+		t.Fatalf("stored timestamp = %d, want %d", stored.Timestamp, block.Timestamp)
+	}
+	if got := []uint64{stored.Events[0].LogIndex, stored.Events[1].LogIndex}; !reflect.DeepEqual(got, []uint64{2, 7}) {
+		t.Fatalf("stored log indexes = %v, want [2 7]", got)
+	}
+}
+
 func TestStateTracksAppends(t *testing.T) {
 	s := new(Store)
 	if s.State() != (State{}) {
@@ -116,6 +138,12 @@ func TestDigestDistinguishesChains(t *testing.T) {
 		"unframed left":  chain(tail(2, ev("ab", ""))),
 		"unframed right": chain(tail(2, ev("a", "b"))),
 	}
+	withTimestamp := chain(tail(2, ev("b", "x")))
+	withTimestamp[1].Timestamp = 1
+	variants["block timestamp"] = withTimestamp
+	withLogIndex := chain(tail(2, ev("b", "x")))
+	withLogIndex[1].Events[0].LogIndex = 1
+	variants["event log index"] = withLogIndex
 
 	seen := make(map[Hash]string, len(variants))
 	for name, blocks := range variants {
