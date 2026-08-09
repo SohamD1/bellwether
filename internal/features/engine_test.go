@@ -531,3 +531,84 @@ func TestReplayBatchMatchesManualStreaming(t *testing.T) {
 		t.Fatalf("ReplayBatch snapshots =\n%#v\nwant streaming\n%#v", batch, manual)
 	}
 }
+
+func TestReplayBatchMatchesManualStreamingAcrossMillionEvents(t *testing.T) {
+	const eventCount = 1_000_000
+
+	steps := parityStressSteps(eventCount)
+	batch, err := ReplayBatch("market-parity", 128, steps)
+	if err != nil {
+		t.Fatalf("ReplayBatch: %v", err)
+	}
+	if len(batch) != eventCount {
+		t.Fatalf("ReplayBatch returned %d snapshots, want %d", len(batch), eventCount)
+	}
+
+	stream, err := NewEngine("market-parity", 128)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	for index, step := range steps {
+		if err := stream.Apply(step.Update); err != nil {
+			t.Fatalf("stream Apply at event %d: %v", index, err)
+		}
+		got, err := stream.Snapshot(step.Snapshot)
+		if err != nil {
+			t.Fatalf("stream Snapshot at event %d: %v", index, err)
+		}
+		if got != batch[index] {
+			t.Fatalf("event %d batch snapshot = %#v, want streaming %#v", index, batch[index], got)
+		}
+	}
+}
+
+func parityStressSteps(eventCount int) []BatchStep {
+	const marketID = "market-parity"
+
+	steps := make([]BatchStep, eventCount)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	resolution := base.Add(time.Duration(eventCount+3_600) * time.Second)
+	blockNumber := uint64(1_000_000)
+
+	for index := range steps {
+		updateTime := base.Add(time.Duration(index) * time.Second)
+		update := Update{
+			MarketID:       marketID,
+			BlockNumber:    blockNumber,
+			LogIndex:       uint64(index % 17),
+			BlockTimestamp: updateTime,
+			YesReserve:     100 + float64((index*17)%997),
+			NoReserve:      100 + float64((index*31)%991),
+			ResolutionTime: resolution,
+			Finality:       chain.Finality(index % 3),
+		}
+		if index%4 != 0 {
+			direction := TradeYES
+			if index%2 != 0 {
+				direction = TradeNO
+			}
+			update.Trade = &Trade{
+				Direction: direction,
+				Amount:    float64(1 + index%23),
+			}
+		}
+
+		blockLag := uint64(index % 5)
+		snapshotBlock := blockNumber + blockLag
+		snapshotLog := update.LogIndex
+		if blockLag != 0 {
+			snapshotLog = uint64(index % 19)
+		}
+		steps[index] = BatchStep{
+			Update: update,
+			Snapshot: SnapshotPoint{
+				MarketID:       marketID,
+				BlockNumber:    snapshotBlock,
+				LogIndex:       snapshotLog,
+				BlockTimestamp: updateTime.Add(time.Duration(index%4) * time.Millisecond),
+			},
+		}
+		blockNumber = snapshotBlock + 1
+	}
+	return steps
+}
