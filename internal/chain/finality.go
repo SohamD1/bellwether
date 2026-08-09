@@ -21,6 +21,8 @@ var (
 	ErrInvalidFinality = errors.New("chain: invalid finality")
 	// ErrFinalityRegression reports an attempt to move finality backward.
 	ErrFinalityRegression = errors.New("chain: finality regression")
+	// ErrInvalidCheckpointOrder reports finalized above safe.
+	ErrInvalidCheckpointOrder = errors.New("chain: finalized checkpoint above safe checkpoint")
 )
 
 // MarkFinality advances hash and every earlier stored block to level. Marking a
@@ -52,6 +54,44 @@ func (s *Store) MarkFinality(hash Hash, level Finality) error {
 			s.finality[i] = level
 		}
 	}
+	return nil
+}
+
+// MarkCheckpoints atomically advances the optional safe and finalized
+// checkpoints. Both updates are validated before either becomes observable.
+func (s *Store) MarkCheckpoints(safeHash, finalizedHash *Hash) error {
+	if safeHash != nil && finalizedHash != nil {
+		safeIndex, finalizedIndex := -1, -1
+		for index := range s.blocks {
+			if s.blocks[index].Hash == *safeHash {
+				safeIndex = index
+			}
+			if s.blocks[index].Hash == *finalizedHash {
+				finalizedIndex = index
+			}
+		}
+		if safeIndex < 0 || finalizedIndex < 0 {
+			return ErrUnknownBlock
+		}
+		if finalizedIndex > safeIndex {
+			return ErrInvalidCheckpointOrder
+		}
+	}
+	staged := &Store{
+		blocks:   s.blocks,
+		finality: append([]Finality(nil), s.finality...),
+	}
+	if safeHash != nil {
+		if err := staged.MarkFinality(*safeHash, FinalitySafe); err != nil {
+			return err
+		}
+	}
+	if finalizedHash != nil {
+		if err := staged.MarkFinality(*finalizedHash, FinalityFinalized); err != nil {
+			return err
+		}
+	}
+	s.finality = staged.finality
 	return nil
 }
 

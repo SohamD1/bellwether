@@ -8,10 +8,13 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 type fakeEthBackend struct {
 	header       *types.Header
+	headers      map[int64]*types.Header
+	headerCalls  []int64
 	logs         []types.Log
 	subscription ethereum.Subscription
 	filterQuery  ethereum.FilterQuery
@@ -25,15 +28,19 @@ type valueEthBackend struct{}
 func (valueEthBackend) FilterLogs(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
 	return nil, nil
 }
+
 func (valueEthBackend) SubscribeFilterLogs(context.Context, ethereum.FilterQuery, chan<- types.Log) (ethereum.Subscription, error) {
 	return nil, nil
 }
+
 func (valueEthBackend) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
 	return nil, nil
 }
+
 func (valueEthBackend) SubscribeNewHead(context.Context, chan<- *types.Header) (ethereum.Subscription, error) {
 	return nil, nil
 }
+
 func (valueEthBackend) Close() {}
 
 func (f *fakeEthBackend) FilterLogs(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
@@ -47,7 +54,13 @@ func (f *fakeEthBackend) SubscribeFilterLogs(_ context.Context, query ethereum.F
 	return f.subscription, nil
 }
 
-func (f *fakeEthBackend) HeaderByNumber(_ context.Context, _ *big.Int) (*types.Header, error) {
+func (f *fakeEthBackend) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	if number != nil {
+		f.headerCalls = append(f.headerCalls, number.Int64())
+		if header, ok := f.headers[number.Int64()]; ok {
+			return header, nil
+		}
+	}
 	return f.header, nil
 }
 
@@ -62,7 +75,8 @@ type stubSubscription struct {
 	errors chan error
 }
 
-func (s *stubSubscription) Unsubscribe()      { close(s.errors) }
+func (s *stubSubscription) Unsubscribe() { close(s.errors) }
+
 func (s *stubSubscription) Err() <-chan error { return s.errors }
 
 func TestEthClientDelegatesNarrowRPCSurface(t *testing.T) {
@@ -107,6 +121,33 @@ func TestEthClientDelegatesNarrowRPCSurface(t *testing.T) {
 	client.Close()
 	if !backend.closed {
 		t.Fatal("Close did not close the underlying client")
+	}
+}
+
+func TestEthClientUsesCanonicalFinalityBlockTags(t *testing.T) {
+	t.Parallel()
+
+	safe := &types.Header{Number: big.NewInt(40)}
+	finalized := &types.Header{Number: big.NewInt(38)}
+	backend := &fakeEthBackend{headers: map[int64]*types.Header{
+		rpc.SafeBlockNumber.Int64():      safe,
+		rpc.FinalizedBlockNumber.Int64(): finalized,
+	}}
+	client, err := NewEthClient(backend)
+	if err != nil {
+		t.Fatalf("NewEthClient: %v", err)
+	}
+
+	gotSafe, err := client.SafeHeader(context.Background())
+	if err != nil || gotSafe != safe {
+		t.Fatalf("SafeHeader = %p, %v, want %p", gotSafe, err, safe)
+	}
+	gotFinalized, err := client.FinalizedHeader(context.Background())
+	if err != nil || gotFinalized != finalized {
+		t.Fatalf("FinalizedHeader = %p, %v, want %p", gotFinalized, err, finalized)
+	}
+	if len(backend.headerCalls) != 2 || backend.headerCalls[0] != rpc.SafeBlockNumber.Int64() || backend.headerCalls[1] != rpc.FinalizedBlockNumber.Int64() {
+		t.Fatalf("HeaderByNumber tags = %v, want canonical safe/finalized values", backend.headerCalls)
 	}
 }
 

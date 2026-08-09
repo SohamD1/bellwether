@@ -18,8 +18,12 @@ var (
 	// ErrInvalidCoordinatorConfig reports a coordinator dependency or bound
 	// that cannot make deterministic progress.
 	ErrInvalidCoordinatorConfig = errors.New("indexer: invalid coordinator configuration")
-	// ErrDisconnectedBranch reports headers or logs that do not form the
-	// announced branch. Canonical state is not changed in this case.
+	// ErrDisconnectedBranch reports headers, logs, or finality checkpoints that
+	// do not match the canonical branch. Block assembly and reconciliation
+	// failures occur before mutation. A finality-refresh failure may be returned
+	// after a block or reorg commit; that canonical commit remains durable, the
+	// checkpoint pair itself is atomic, and idempotently retrying the same
+	// ingestion retries the refresh.
 	ErrDisconnectedBranch = errors.New("indexer: disconnected branch")
 	// ErrHeaderSubscriptionClosed reports a live head subscription that ended
 	// without a provider error or caller cancellation.
@@ -48,6 +52,7 @@ func (e *ResyncRequiredError) Unwrap() error { return ErrResyncRequired }
 type BlockReader interface {
 	base.LogClient
 	base.HeaderClient
+	base.FinalityHeaderClient
 }
 
 // EventDecoder is the fixture decoding boundary consumed by the coordinator.
@@ -142,7 +147,10 @@ func (c *Coordinator) Backfill(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return c.commitCandidate(candidate)
+	if err := c.commitCandidate(candidate); err != nil {
+		return err
+	}
+	return c.refreshFinality(ctx)
 }
 
 func (c *Coordinator) buildBackfillRange(ctx context.Context, from, to uint64) ([]chain.Block, error) {
@@ -256,12 +264,15 @@ func (c *Coordinator) ingestHead(ctx context.Context, announced *types.Header) e
 	}
 	headHash := chain.Hash(announced.Hash())
 	if stored, ok := c.store.ByNumber(headNumber); ok && stored.Hash == headHash {
-		return nil
+		return c.refreshFinality(ctx)
 	}
 
 	tip, hasTip := c.store.Tip()
 	if !hasTip {
-		return c.ingestFirstHead(ctx, announced)
+		if err := c.ingestFirstHead(ctx, announced); err != nil {
+			return err
+		}
+		return c.refreshFinality(ctx)
 	}
 
 	var headersDescending []*types.Header
@@ -307,7 +318,10 @@ func (c *Coordinator) ingestHead(ctx context.Context, announced *types.Header) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return c.commitCandidate(candidate)
+	if err := c.commitCandidate(candidate); err != nil {
+		return err
+	}
+	return c.refreshFinality(ctx)
 }
 
 func (c *Coordinator) ingestFirstHead(ctx context.Context, announced *types.Header) error {
@@ -394,6 +408,82 @@ func (c *Coordinator) commitCandidate(candidate []chain.Block) error {
 		return nil
 	}
 	return nil
+}
+
+func (c *Coordinator) refreshFinality(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	safeHeader, err := c.reader.SafeHeader(ctx)
+	if err != nil {
+		return rpcError(ctx, "safe header", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	finalizedHeader, err := c.reader.FinalizedHeader(ctx)
+	if err != nil {
+		return rpcError(ctx, "finalized header", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	safeNumber, err := checkedHeaderNumber(safeHeader, nil)
+	if err != nil {
+		return err
+	}
+	finalizedNumber, err := checkedHeaderNumber(finalizedHeader, nil)
+	if err != nil {
+		return err
+	}
+	if finalizedNumber > safeNumber {
+		return fmt.Errorf("%w: finalized block %d is above safe block %d", ErrDisconnectedBranch, finalizedNumber, safeNumber)
+	}
+
+	blocks := c.store.Blocks()
+	if len(blocks) == 0 {
+		if safeNumber < c.config.StartBlock {
+			return nil
+		}
+		return fmt.Errorf("%w: safe block %d is above empty store", ErrDisconnectedBranch, safeNumber)
+	}
+	oldestNumber := blocks[0].Number
+	tip := blocks[len(blocks)-1]
+	if safeNumber > tip.Number {
+		return fmt.Errorf("%w: safe block %d is above tip %d", ErrDisconnectedBranch, safeNumber, tip.Number)
+	}
+
+	safeHash, err := c.validateCheckpoint(safeHeader, safeNumber, oldestNumber, chain.FinalitySafe)
+	if err != nil {
+		return err
+	}
+	finalizedHash, err := c.validateCheckpoint(finalizedHeader, finalizedNumber, oldestNumber, chain.FinalityFinalized)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.store.MarkCheckpoints(safeHash, finalizedHash); err != nil {
+		return fmt.Errorf("%w: apply finality checkpoints: %v", ErrDisconnectedBranch, err)
+	}
+	return nil
+}
+
+func (c *Coordinator) validateCheckpoint(header *types.Header, number, oldestNumber uint64, level chain.Finality) (*chain.Hash, error) {
+	if number < oldestNumber {
+		return nil, nil
+	}
+	stored, ok := c.store.ByNumber(number)
+	if !ok || stored.Hash != chain.Hash(header.Hash()) {
+		return nil, fmt.Errorf("%w: %v checkpoint block %d does not match canonical store", ErrDisconnectedBranch, level, number)
+	}
+	if current, ok := c.store.Checkpoint(level); ok && number <= current.Number {
+		return nil, nil
+	}
+	hash := stored.Hash
+	return &hash, nil
 }
 
 func (c *Coordinator) resync(headNumber uint64) error {

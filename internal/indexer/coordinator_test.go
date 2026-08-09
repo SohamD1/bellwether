@@ -23,6 +23,9 @@ type fakeBlockReader struct {
 	logs          map[common.Hash][]types.Log
 	headerCalls   []uint64
 	filterQueries []ethereum.FilterQuery
+	finalityCalls []string
+	safeResult    func(context.Context) (*types.Header, error)
+	finalResult   func(context.Context) (*types.Header, error)
 }
 
 type cancelingBlockReader struct {
@@ -46,6 +49,14 @@ func (f *flippingBlockReader) HeaderByNumber(_ context.Context, number *big.Int)
 		headers = f.second
 	}
 	return cloneHeader(headers[number.Uint64()]), nil
+}
+
+func (f *flippingBlockReader) SafeHeader(context.Context) (*types.Header, error) {
+	return &types.Header{Number: new(big.Int)}, nil
+}
+
+func (f *flippingBlockReader) FinalizedHeader(context.Context) (*types.Header, error) {
+	return &types.Header{Number: new(big.Int)}, nil
 }
 
 func (f *flippingBlockReader) FilterLogs(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
@@ -79,6 +90,28 @@ func (f *fakeBlockReader) HeaderByNumber(_ context.Context, number *big.Int) (*t
 	n := number.Uint64()
 	f.headerCalls = append(f.headerCalls, n)
 	return cloneHeader(f.headers[n]), nil
+}
+
+func (f *fakeBlockReader) SafeHeader(ctx context.Context) (*types.Header, error) {
+	f.mu.Lock()
+	f.finalityCalls = append(f.finalityCalls, "safe")
+	result := f.safeResult
+	f.mu.Unlock()
+	if result != nil {
+		return result(ctx)
+	}
+	return &types.Header{Number: new(big.Int)}, nil
+}
+
+func (f *fakeBlockReader) FinalizedHeader(ctx context.Context) (*types.Header, error) {
+	f.mu.Lock()
+	f.finalityCalls = append(f.finalityCalls, "finalized")
+	result := f.finalResult
+	f.mu.Unlock()
+	if result != nil {
+		return result(ctx)
+	}
+	return &types.Header{Number: new(big.Int)}, nil
 }
 
 func (f *fakeBlockReader) FilterLogs(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
@@ -148,7 +181,8 @@ func newFakeHeadSubscription() *fakeHeadSubscription {
 	return &fakeHeadSubscription{errors: make(chan error), unsubscribed: make(chan struct{})}
 }
 
-func (s *fakeHeadSubscription) Unsubscribe()      { s.once.Do(func() { close(s.unsubscribed) }) }
+func (s *fakeHeadSubscription) Unsubscribe() { s.once.Do(func() { close(s.unsubscribed) }) }
+
 func (s *fakeHeadSubscription) Err() <-chan error { return s.errors }
 
 func testHeader(number uint64, parent common.Hash, tag byte) *types.Header {
@@ -571,5 +605,449 @@ func TestCoordinatorDoesNotCommitAHeadWhenCancellationWinsDuringFetch(t *testing
 	}
 	if store.Len() != 1 {
 		t.Fatalf("canceled head mutated store to %d blocks", store.Len())
+	}
+}
+
+func headerResult(header *types.Header) func(context.Context) (*types.Header, error) {
+	return func(context.Context) (*types.Header, error) { return cloneHeader(header), nil }
+}
+
+func TestCoordinatorBackfillRetryRefreshesFinalityWithoutDuplicatingCommittedData(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	mismatchedSafe := types.CopyHeader(headers[11])
+	mismatchedSafe.Extra = []byte{0xff}
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        map[common.Hash][]types.Log{headers[11].Hash(): {rpcLog(headers[11], 0, 1)}},
+		safeResult:  headerResult(mismatchedSafe),
+		finalResult: headerResult(headers[10]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); !errors.Is(err, ErrDisconnectedBranch) {
+		t.Fatalf("Backfill = %v, want post-commit ErrDisconnectedBranch", err)
+	}
+	committedBlocks := store.Blocks()
+	committedState := store.State()
+	if len(committedBlocks) != 3 {
+		t.Fatalf("failed refresh left %d blocks, want 3 committed blocks", len(committedBlocks))
+	}
+	if len(committedBlocks[1].Events) != 1 {
+		t.Fatalf("failed refresh left %d events in block 11, want 1 committed event", len(committedBlocks[1].Events))
+	}
+	assertNoFinality(t, store)
+
+	reader.safeResult = headerResult(headers[11])
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("retry Backfill: %v", err)
+	}
+	if !reflect.DeepEqual(store.Blocks(), committedBlocks) || store.State() != committedState {
+		t.Fatal("retry duplicated or replayed already committed canonical data")
+	}
+	safe, hasSafe := store.Checkpoint(chain.FinalitySafe)
+	finalized, hasFinalized := store.Checkpoint(chain.FinalityFinalized)
+	if !hasSafe || safe.Number != 11 || !hasFinalized || finalized.Number != 10 {
+		t.Fatalf("retry checkpoints = safe %+v/%v finalized %+v/%v, want 11 and 10", safe, hasSafe, finalized, hasFinalized)
+	}
+}
+
+func TestCoordinatorLiveRetryRefreshesFinalityWithoutDuplicatingCommittedHead(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 13, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers: headers,
+		latest:  headers[12],
+		logs:    map[common.Hash][]types.Log{headers[13].Hash(): {rpcLog(headers[13], 0, 1)}},
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	providerErr := errors.New("finalized checkpoint unavailable")
+	reader.safeResult = headerResult(headers[12])
+	reader.finalResult = func(context.Context) (*types.Header, error) { return nil, providerErr }
+
+	if err := coordinator.ingestHead(context.Background(), headers[13]); !errors.Is(err, providerErr) {
+		t.Fatalf("ingestHead = %v, want post-commit provider error", err)
+	}
+	committedBlocks := store.Blocks()
+	committedState := store.State()
+	if len(committedBlocks) != 4 {
+		t.Fatalf("failed refresh left %d blocks, want 4 committed blocks", len(committedBlocks))
+	}
+	if len(committedBlocks[3].Events) != 1 {
+		t.Fatalf("failed refresh left %d events in block 13, want 1 committed event", len(committedBlocks[3].Events))
+	}
+	assertNoFinality(t, store)
+
+	reader.finalResult = headerResult(headers[11])
+	if err := coordinator.ingestHead(context.Background(), headers[13]); err != nil {
+		t.Fatalf("retry duplicate ingestHead: %v", err)
+	}
+	if !reflect.DeepEqual(store.Blocks(), committedBlocks) || store.State() != committedState {
+		t.Fatal("retry duplicated or reconciled the already committed live head")
+	}
+	safe, hasSafe := store.Checkpoint(chain.FinalitySafe)
+	finalized, hasFinalized := store.Checkpoint(chain.FinalityFinalized)
+	if !hasSafe || safe.Number != 12 || !hasFinalized || finalized.Number != 11 {
+		t.Fatalf("retry checkpoints = safe %+v/%v finalized %+v/%v, want 12 and 11", safe, hasSafe, finalized, hasFinalized)
+	}
+}
+
+func TestCoordinatorBackfillRefreshesBaseFinalityCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        make(map[common.Hash][]types.Log),
+		safeResult:  headerResult(headers[11]),
+		finalResult: headerResult(headers[10]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	safe, hasSafe := store.Checkpoint(chain.FinalitySafe)
+	finalized, hasFinalized := store.Checkpoint(chain.FinalityFinalized)
+	if !hasSafe || safe.Number != 11 || !hasFinalized || finalized.Number != 10 {
+		t.Fatalf("checkpoints = safe %+v/%v finalized %+v/%v, want 11 and 10", safe, hasSafe, finalized, hasFinalized)
+	}
+	if !reflect.DeepEqual(reader.finalityCalls, []string{"safe", "finalized"}) {
+		t.Fatalf("finality calls = %v, want safe then finalized", reader.finalityCalls)
+	}
+}
+
+func TestCoordinatorLiveHeadRefreshesBaseFinalityCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 13, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{headers: headers, latest: headers[10], logs: make(map[common.Hash][]types.Log)}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	reader.safeResult = headerResult(headers[12])
+	reader.finalResult = headerResult(headers[11])
+
+	if err := coordinator.ingestHead(context.Background(), headers[13]); err != nil {
+		t.Fatalf("ingestHead: %v", err)
+	}
+	safe, _ := store.Checkpoint(chain.FinalitySafe)
+	finalized, _ := store.Checkpoint(chain.FinalityFinalized)
+	if safe.Number != 12 || finalized.Number != 11 {
+		t.Fatalf("live checkpoints = safe %d finalized %d, want 12 and 11", safe.Number, finalized.Number)
+	}
+}
+
+func TestCoordinatorDuplicateLiveHeadStillRefreshesFinality(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{headers: headers, latest: headers[12], logs: make(map[common.Hash][]types.Log)}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	reader.safeResult = headerResult(headers[11])
+	reader.finalResult = headerResult(headers[10])
+
+	if err := coordinator.ingestHead(context.Background(), headers[12]); err != nil {
+		t.Fatalf("duplicate ingestHead: %v", err)
+	}
+	safe, hasSafe := store.Checkpoint(chain.FinalitySafe)
+	finalized, hasFinalized := store.Checkpoint(chain.FinalityFinalized)
+	if !hasSafe || safe.Number != 11 || !hasFinalized || finalized.Number != 10 {
+		t.Fatalf("duplicate head checkpoints = safe %+v/%v finalized %+v/%v", safe, hasSafe, finalized, hasFinalized)
+	}
+}
+
+func TestCoordinatorAllowsSafeAndFinalizedAtSameBlock(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        make(map[common.Hash][]types.Log),
+		safeResult:  headerResult(headers[11]),
+		finalResult: headerResult(headers[11]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	for _, level := range []chain.Finality{chain.FinalitySafe, chain.FinalityFinalized} {
+		checkpoint, ok := store.Checkpoint(level)
+		if !ok || checkpoint.Number != 11 {
+			t.Fatalf("Checkpoint(%v) = %+v/%v, want block 11", level, checkpoint, ok)
+		}
+	}
+}
+
+func TestCoordinatorSkipsFinalityCheckpointsBelowOldestStoredBlock(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers: headers,
+		latest:  headers[12],
+		logs:    make(map[common.Hash][]types.Log),
+		safeResult: func(context.Context) (*types.Header, error) {
+			return testHeader(9, common.Hash{0xaa}, 0x02), nil
+		},
+		finalResult: func(context.Context) (*types.Header, error) {
+			return testHeader(8, common.Hash{0xbb}, 0x03), nil
+		},
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	if _, ok := store.Checkpoint(chain.FinalitySafe); ok {
+		t.Fatal("below-start safe checkpoint was stored")
+	}
+	if _, ok := store.Checkpoint(chain.FinalityFinalized); ok {
+		t.Fatal("below-start finalized checkpoint was stored")
+	}
+}
+
+func TestCoordinatorFinalityRefreshIsMonotonicAcrossStaleRepeats(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        make(map[common.Hash][]types.Log),
+		safeResult:  headerResult(headers[11]),
+		finalResult: headerResult(headers[10]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	reader.safeResult = headerResult(headers[10])
+	reader.finalResult = headerResult(headers[10])
+
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("stale repeat Backfill: %v", err)
+	}
+	safe, _ := store.Checkpoint(chain.FinalitySafe)
+	finalized, _ := store.Checkpoint(chain.FinalityFinalized)
+	if safe.Number != 11 || finalized.Number != 10 {
+		t.Fatalf("stale repeat regressed checkpoints to safe %d finalized %d", safe.Number, finalized.Number)
+	}
+}
+
+func TestCoordinatorRejectsInvalidFinalityOrderWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        make(map[common.Hash][]types.Log),
+		safeResult:  headerResult(headers[10]),
+		finalResult: headerResult(headers[11]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); !errors.Is(err, ErrDisconnectedBranch) {
+		t.Fatalf("Backfill = %v, want ErrDisconnectedBranch", err)
+	}
+	assertNoFinality(t, store)
+}
+
+func TestCoordinatorRejectsFinalityHashMismatchWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	mismatchedSafe := types.CopyHeader(headers[11])
+	mismatchedSafe.Extra = []byte{0xff}
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        make(map[common.Hash][]types.Log),
+		safeResult:  headerResult(mismatchedSafe),
+		finalResult: headerResult(headers[10]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); !errors.Is(err, ErrDisconnectedBranch) {
+		t.Fatalf("Backfill = %v, want ErrDisconnectedBranch", err)
+	}
+	assertNoFinality(t, store)
+}
+
+func TestCoordinatorRejectsFinalityAboveTipWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 13, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        make(map[common.Hash][]types.Log),
+		safeResult:  headerResult(headers[13]),
+		finalResult: headerResult(headers[12]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); !errors.Is(err, ErrDisconnectedBranch) {
+		t.Fatalf("Backfill = %v, want ErrDisconnectedBranch", err)
+	}
+	assertNoFinality(t, store)
+}
+
+func TestCoordinatorRejectsMalformedFinalityHeadersWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		safe      func(context.Context) (*types.Header, error)
+		finalized func(context.Context) (*types.Header, error)
+	}{
+		{
+			name:      "nil safe",
+			safe:      func(context.Context) (*types.Header, error) { return nil, nil },
+			finalized: headerResult(&types.Header{Number: big.NewInt(10)}),
+		},
+		{
+			name:      "nil finalized",
+			safe:      headerResult(&types.Header{Number: big.NewInt(11)}),
+			finalized: func(context.Context) (*types.Header, error) { return nil, nil },
+		},
+		{
+			name:      "nil safe number",
+			safe:      headerResult(&types.Header{}),
+			finalized: headerResult(&types.Header{Number: big.NewInt(10)}),
+		},
+		{
+			name:      "negative finalized number",
+			safe:      headerResult(&types.Header{Number: big.NewInt(11)}),
+			finalized: headerResult(&types.Header{Number: big.NewInt(-1)}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+			reader := &fakeBlockReader{headers: headers, latest: headers[12], logs: make(map[common.Hash][]types.Log)}
+			store := new(chain.Store)
+			coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+			if err := coordinator.Backfill(context.Background()); err != nil {
+				t.Fatalf("seed Backfill: %v", err)
+			}
+			reader.safeResult = tt.safe
+			reader.finalResult = tt.finalized
+
+			if err := coordinator.refreshFinality(context.Background()); !errors.Is(err, ErrDisconnectedBranch) {
+				t.Fatalf("refreshFinality = %v, want ErrDisconnectedBranch", err)
+			}
+			assertNoFinality(t, store)
+		})
+	}
+}
+
+func TestCoordinatorFinalitySecondCallFailureDoesNotPartiallyAdvance(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{headers: headers, latest: headers[12], logs: make(map[common.Hash][]types.Log)}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("seed Backfill: %v", err)
+	}
+	providerErr := errors.New("finalized unavailable")
+	reader.safeResult = headerResult(headers[11])
+	reader.finalResult = func(context.Context) (*types.Header, error) { return nil, providerErr }
+
+	if err := coordinator.refreshFinality(context.Background()); !errors.Is(err, providerErr) {
+		t.Fatalf("refreshFinality = %v, want provider error", err)
+	}
+	assertNoFinality(t, store)
+}
+
+func TestCoordinatorFinalityRefreshReturnsContextCancellationWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{headers: headers, latest: headers[12], logs: make(map[common.Hash][]types.Log)}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("seed Backfill: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	reader.safeResult = headerResult(headers[11])
+	reader.finalResult = func(context.Context) (*types.Header, error) {
+		cancel()
+		return nil, errors.New("provider canceled")
+	}
+
+	if err := coordinator.refreshFinality(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("refreshFinality = %v, want context.Canceled", err)
+	}
+	assertNoFinality(t, store)
+}
+
+func TestCoordinatorFinalizedCheckpointProtectsSubsequentReorg(t *testing.T) {
+	t.Parallel()
+
+	original := linearHeaders(10, 14, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers:     original,
+		latest:      original[14],
+		logs:        make(map[common.Hash][]types.Log),
+		safeResult:  headerResult(original[13]),
+		finalResult: headerResult(original[12]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 10))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	before := store.Blocks()
+
+	fork := linearHeaders(11, 15, original[10].Hash(), 0x02)
+	reader.headers = mergeHeaders(map[uint64]*types.Header{10: original[10]}, fork)
+	if err := coordinator.ingestHead(context.Background(), fork[15]); !errors.Is(err, ErrResyncRequired) {
+		t.Fatalf("ingestHead = %v, want ErrResyncRequired", err)
+	}
+	if !reflect.DeepEqual(store.Blocks(), before) {
+		t.Fatal("reorg below finalized checkpoint mutated canonical blocks")
+	}
+	finalized, ok := store.Checkpoint(chain.FinalityFinalized)
+	if !ok || finalized.Number != 12 {
+		t.Fatalf("finalized checkpoint = %+v/%v, want unchanged block 12", finalized, ok)
+	}
+}
+
+func assertNoFinality(t *testing.T, store *chain.Store) {
+	t.Helper()
+	if safe, ok := store.Checkpoint(chain.FinalitySafe); ok {
+		t.Fatalf("unexpected safe checkpoint %+v", safe)
+	}
+	if finalized, ok := store.Checkpoint(chain.FinalityFinalized); ok {
+		t.Fatalf("unexpected finalized checkpoint %+v", finalized)
 	}
 }
