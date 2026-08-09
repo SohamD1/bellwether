@@ -1,6 +1,11 @@
 package market
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/SohamD1/bellwether/internal/base"
+)
 
 func TestFixtureABIContract(t *testing.T) {
 	t.Parallel()
@@ -62,5 +67,19 @@ func TestFixtureABIContract(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFixtureEventTopicsReturnsAllPinnedTopicsDefensively(t *testing.T) {
+	t.Parallel()
+
+	got := FixtureEventTopics()
+	want := []base.Hash{eventTopic("Trade"), eventTopic("LiquidityChanged"), eventTopic("MarketResolved")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FixtureEventTopics = %x, want %x", got, want)
+	}
+	got[0] = base.Hash{}
+	if again := FixtureEventTopics(); again[0] != want[0] {
+		t.Fatal("FixtureEventTopics returned mutable package state")
 	}
 }
