@@ -142,6 +142,25 @@ func TestDecoderDecodesMarketResolved(t *testing.T) {
 	}
 }
 
+func TestDecoderRejectsNoncanonicalIndexedAddress(t *testing.T) {
+	contract := base.Address{19: 0xD1}
+	marketID := base.Hash{31: 0xA1}
+	trader := base.Address{0: 0x11, 19: 0x22}
+	log := fixtureLog(t, contract, "Trade", []any{marketID, trader}, true, big.NewInt(1), big.NewInt(2), big.NewInt(3), uint64(4))
+	log.Topics[2][0] = 0xFF
+	decoder, err := NewDecoder(contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decoder.Decode(log)
+	if got != nil {
+		t.Errorf("Decode() event = %T, want nil", got)
+	}
+	if errors.Is(err, ErrMalformedLog) == false {
+		t.Fatalf("Decode() error = %v, want ErrMalformedLog", err)
+	}
+}
+
 func TestDecoderRejectsInvalidLogs(t *testing.T) {
 	contract := base.Address{19: 0xD4}
 	decoder, err := NewDecoder(contract)
@@ -164,6 +183,9 @@ func TestDecoderRejectsInvalidLogs(t *testing.T) {
 	malformed.Data = []byte{1}
 	extraData := resolved
 	extraData.Data = append(append([]byte(nil), resolved.Data...), make([]byte, 32)...)
+	noncanonicalBool := resolved
+	noncanonicalBool.Data = append([]byte(nil), resolved.Data...)
+	noncanonicalBool.Data[31] = 2
 	tests := []struct {
 		name string
 		log  base.Log
@@ -177,6 +199,7 @@ func TestDecoderRejectsInvalidLogs(t *testing.T) {
 		{"extra indexed topic", extraTopic, ErrMalformedLog},
 		{"malformed ABI data", malformed, ErrMalformedLog},
 		{"extra ABI data", extraData, ErrMalformedLog},
+		{"noncanonical boolean", noncanonicalBool, ErrMalformedLog},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

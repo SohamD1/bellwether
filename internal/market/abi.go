@@ -160,6 +160,12 @@ func unpackIndexed(event abi.Event, topics []base.Hash) (map[string]interface{},
 	for i := range topics {
 		converted[i] = common.Hash(topics[i])
 	}
+	var zeroAddressPadding [12]byte
+	for i, argument := range arguments {
+		if argument.Type.T == abi.AddressTy && bytes.Equal(converted[i][:12], zeroAddressPadding[:]) == false {
+			return nil, fmt.Errorf("unpack %s indexed topic %s: non-canonical address padding", event.Name, argument.Name)
+		}
+	}
 	values := make(map[string]interface{})
 	if err := abi.ParseTopicsIntoMap(values, arguments, converted); err != nil {
 		return nil, fmt.Errorf("unpack %s indexed topics: %w", event.Name, err)
