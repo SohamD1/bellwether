@@ -102,12 +102,20 @@ func TestSyntheticReorgs(t *testing.T) {
 			clean := new(Store)
 			appendAll(t, clean, canonical)
 			if !reflect.DeepEqual(s.Blocks(), clean.Blocks()) {
-				t.Fatalf("state after %d reorgs differs from clean replay", reorgs)
+				t.Fatalf("blocks after %d reorgs differ from clean replay", reorgs)
+			}
+			if s.State() != clean.State() {
+				t.Fatalf("state after %d reorgs = %+v, want %+v", reorgs, s.State(), clean.State())
+			}
+			// The store folds incrementally as blocks arrive; foldAll is one
+			// pass over the same chain. Streaming and batch must agree.
+			if s.State() != foldAll(canonical) {
+				t.Fatalf("incremental state = %+v, want %+v", s.State(), foldAll(canonical))
 			}
 
-			before := s.Blocks()
+			before, beforeState := s.Blocks(), s.State()
 			appendAll(t, s, canonical)
-			if !reflect.DeepEqual(s.Blocks(), before) {
+			if !reflect.DeepEqual(s.Blocks(), before) || s.State() != beforeState {
 				t.Fatal("replaying the canonical chain changed the store")
 			}
 		})

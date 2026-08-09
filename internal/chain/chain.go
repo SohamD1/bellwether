@@ -37,6 +37,7 @@ var ErrBrokenBranch = errors.New("chain: branch is not linear")
 // concurrent use.
 type Store struct {
 	blocks []Block
+	state  State
 }
 
 // Tip returns the highest stored block.
@@ -74,6 +75,7 @@ func (s *Store) Append(b Block) error {
 		return ErrNotLinear
 	}
 	s.blocks = append(s.blocks, b)
+	s.state = advance(s.state, b)
 	return nil
 }
 
@@ -90,6 +92,7 @@ func (s *Store) Rollback(to uint64) []Block {
 			// Copied because the next append reuses this backing array.
 			dropped := append([]Block(nil), s.blocks[i:]...)
 			s.blocks = s.blocks[:i]
+			s.rebuild()
 			return dropped
 		}
 	}
@@ -117,6 +120,9 @@ func (s *Store) Reorg(branch []Block) ([]Block, error) {
 		}
 	}
 	dropped := s.Rollback(ancestor.Number)
+	for _, b := range branch {
+		s.state = advance(s.state, b)
+	}
 	s.blocks = append(s.blocks, branch...)
 	return dropped, nil
 }
