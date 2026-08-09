@@ -49,7 +49,7 @@ You need Go 1.23+, Python 3.12+, and [uv](https://docs.astral.sh/uv/). The comma
    go run ./cmd/bellwether --config ./config.toml --export-training-data ./training.parquet
    ```
 
-The repository contains a [Base Sepolia deployment walkthrough](docs/base-sepolia-demo.md), including a dry run and explicit wallet-approved broadcast. Submitted deployments can be inspected on the [Base Sepolia explorer](https://sepolia-explorer.base.org). No key or seed belongs in this repository.
+The contracts are tested locally and in CI and are deployment-ready; this repository does not claim a public Base Sepolia deployment. The repository contains a [Base Sepolia deployment walkthrough](docs/base-sepolia-demo.md), including a dry run and explicit wallet-approved broadcast. Submitted deployments can be inspected on the [Base Sepolia explorer](https://sepolia-explorer.base.org). No key or seed belongs in this repository.
 
 ## Architecture
 
