@@ -15,12 +15,19 @@ def run(*command: str, cwd: Path = ROOT) -> None:
     subprocess.run(command, cwd=cwd, check=True)
 
 
-def go_files() -> list[str]:
+def go_files(root: Path = ROOT) -> list[str]:
     files: list[str] = []
-    for path in ROOT.rglob("*.go"):
-        if ".git" in path.parts or ".venv" in path.parts:
+    for path in root.rglob("*.go"):
+        relative = path.relative_to(root)
+        if {".git", ".pytest-tmp", ".venv", ".worktrees"} & set(relative.parts):
             continue
-        files.append(str(path.relative_to(ROOT)))
+        if any(
+            relative.parts[index] == "contracts"
+            and relative.parts[index + 1] in {"broadcast", "cache", "lib", "out"}
+            for index in range(len(relative.parts) - 1)
+        ):
+            continue
+        files.append(str(relative))
     return sorted(files)
 
 

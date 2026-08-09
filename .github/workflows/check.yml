@@ -21,7 +21,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          # No third-party modules yet, so there is nothing to cache.
           cache: false
 
       - uses: astral-sh/setup-uv@v6
@@ -33,3 +32,18 @@ jobs:
       - run: python3 scripts/dev.py check
 
       - run: python3 scripts/dev.py test-race
+
+      - name: Install Foundry
+        # foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09
+        with:
+          version: v1.7.1
+          cache: false
+
+      - name: Install Solidity test dependency
+        run: forge install foundry-rs/forge-std@v1.16.2 --no-git
+        working-directory: contracts
+
+      - name: Run Solidity tests
+        run: forge test
+        working-directory: contracts
