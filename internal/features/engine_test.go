@@ -92,6 +92,29 @@ func TestEngineSnapshotComputesFromAppliedState(t *testing.T) {
 	}
 }
 
+func TestEngineSnapshotHandlesHugeFiniteTradeWindow(t *testing.T) {
+	engine, _ := NewEngine("market-a", 2)
+	updates := []Update{
+		testUpdate("market-a", 10, 1),
+		testUpdate("market-a", 10, 2),
+	}
+	updates[0].Trade = &Trade{Direction: TradeYES, Amount: math.MaxFloat64}
+	updates[1].Trade = &Trade{Direction: TradeNO, Amount: math.MaxFloat64}
+	for _, update := range updates {
+		if err := engine.Apply(update); err != nil {
+			t.Fatalf("Apply(%d): %v", update.LogIndex, err)
+		}
+	}
+
+	snapshot, err := engine.Snapshot(pointFor(updates[1]))
+	if err != nil {
+		t.Fatalf("Snapshot with huge finite trades: %v", err)
+	}
+	if snapshot.RecentTradeFlowImbalance != 0 {
+		t.Fatalf("huge balanced flow = %v, want 0", snapshot.RecentTradeFlowImbalance)
+	}
+}
+
 func TestEngineApplyEnforcesStrictLogOrder(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -130,6 +153,106 @@ func TestEngineApplyEnforcesStrictLogOrder(t *testing.T) {
 	}
 }
 
+func TestEngineApplyRejectsBackwardTimestampWithoutMutation(t *testing.T) {
+	engine, _ := NewEngine("market-a", 3)
+	seed := testUpdate("market-a", 10, 1)
+	if err := engine.Apply(seed); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+	before, err := engine.Snapshot(pointFor(seed))
+	if err != nil {
+		t.Fatalf("seed Snapshot: %v", err)
+	}
+
+	candidate := testUpdate("market-a", 10, 2)
+	candidate.BlockTimestamp = seed.BlockTimestamp.Add(-time.Nanosecond)
+	if err := engine.Apply(candidate); !errors.Is(err, ErrEventOrder) {
+		t.Fatalf("Apply with backward timestamp error = %v, want ErrEventOrder", err)
+	}
+	after, err := engine.Snapshot(pointFor(seed))
+	if err != nil {
+		t.Fatalf("Snapshot after rejected Apply: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("timestamp-rejected Apply mutated state:\n got: %#v\nwant: %#v", after, before)
+	}
+}
+
+func TestEngineObservationFrontierRejectsUnseenEarlierEvents(t *testing.T) {
+	tests := []struct {
+		name  string
+		block uint64
+		log   uint64
+	}{
+		{name: "before observed position", block: 15, log: 9},
+		{name: "at observed position", block: 20, log: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine, _ := NewEngine("market-a", 3)
+			seed := testUpdate("market-a", 10, 1)
+			if err := engine.Apply(seed); err != nil {
+				t.Fatalf("seed Apply: %v", err)
+			}
+			frontier := SnapshotPoint{
+				MarketID:       "market-a",
+				BlockNumber:    20,
+				LogIndex:       4,
+				BlockTimestamp: seed.BlockTimestamp.Add(10 * time.Second),
+			}
+			before, err := engine.Snapshot(frontier)
+			if err != nil {
+				t.Fatalf("frontier Snapshot: %v", err)
+			}
+
+			candidate := testUpdate("market-a", tt.block, tt.log)
+			candidate.BlockTimestamp = frontier.BlockTimestamp
+			if err := engine.Apply(candidate); !errors.Is(err, ErrEventOrder) {
+				t.Fatalf("Apply(%d, %d) error = %v, want ErrEventOrder", tt.block, tt.log, err)
+			}
+			after, err := engine.Snapshot(frontier)
+			if err != nil {
+				t.Fatalf("Snapshot after rejected Apply: %v", err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("frontier-rejected Apply mutated state:\n got: %#v\nwant: %#v", after, before)
+			}
+		})
+	}
+}
+
+func TestEngineApplyRejectsTimestampBeforeObservedFrontier(t *testing.T) {
+	engine, _ := NewEngine("market-a", 3)
+	seed := testUpdate("market-a", 10, 1)
+	if err := engine.Apply(seed); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+	frontier := SnapshotPoint{
+		MarketID:       "market-a",
+		BlockNumber:    20,
+		LogIndex:       4,
+		BlockTimestamp: seed.BlockTimestamp.Add(10 * time.Second),
+	}
+	before, err := engine.Snapshot(frontier)
+	if err != nil {
+		t.Fatalf("frontier Snapshot: %v", err)
+	}
+
+	candidate := testUpdate("market-a", 21, 0)
+	candidate.BlockTimestamp = frontier.BlockTimestamp.Add(-time.Nanosecond)
+	if err := engine.Apply(candidate); !errors.Is(err, ErrEventOrder) {
+		t.Fatalf("Apply before observed timestamp error = %v, want ErrEventOrder", err)
+	}
+	after, err := engine.Snapshot(frontier)
+	if err != nil {
+		t.Fatalf("Snapshot after rejected Apply: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("frontier-time-rejected Apply mutated state:\n got: %#v\nwant: %#v", after, before)
+	}
+}
+
 func TestEngineSnapshotRejectsPointsBeforeLatestUpdate(t *testing.T) {
 	engine, _ := NewEngine("market-a", 3)
 	update := testUpdate("market-a", 10, 3)
@@ -149,6 +272,10 @@ func TestEngineSnapshotRejectsPointsBeforeLatestUpdate(t *testing.T) {
 			name:  "earlier log in same block",
 			point: SnapshotPoint{MarketID: "market-a", BlockNumber: 10, LogIndex: 2, BlockTimestamp: update.BlockTimestamp},
 		},
+		{
+			name:  "same position with earlier timestamp",
+			point: SnapshotPoint{MarketID: "market-a", BlockNumber: 10, LogIndex: 3, BlockTimestamp: update.BlockTimestamp.Add(-time.Nanosecond)},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -160,6 +287,29 @@ func TestEngineSnapshotRejectsPointsBeforeLatestUpdate(t *testing.T) {
 
 	if _, err := engine.Snapshot(pointFor(update)); err != nil {
 		t.Fatalf("snapshot at inclusive latest position: %v", err)
+	}
+}
+
+func TestEngineRejectedSnapshotDoesNotAdvanceObservationFrontier(t *testing.T) {
+	engine, _ := NewEngine("market-a", 3)
+	seed := testUpdate("market-a", 10, 1)
+	if err := engine.Apply(seed); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+	rejected := SnapshotPoint{
+		MarketID:       "market-a",
+		BlockNumber:    20,
+		LogIndex:       0,
+		BlockTimestamp: seed.BlockTimestamp.Add(-time.Nanosecond),
+	}
+	if _, err := engine.Snapshot(rejected); !errors.Is(err, ErrSnapshotBeforeUpdate) {
+		t.Fatalf("Snapshot with backward timestamp error = %v, want ErrSnapshotBeforeUpdate", err)
+	}
+
+	candidate := testUpdate("market-a", 15, 0)
+	candidate.BlockTimestamp = seed.BlockTimestamp.Add(time.Second)
+	if err := engine.Apply(candidate); err != nil {
+		t.Fatalf("Apply after rejected Snapshot: %v", err)
 	}
 }
 

@@ -32,6 +32,16 @@ func TestYesImpliedProbability(t *testing.T) {
 	}
 }
 
+func TestYesImpliedProbabilityHandlesFiniteOverflowingTotal(t *testing.T) {
+	got, err := YesImpliedProbability(math.MaxFloat64, math.MaxFloat64)
+	if err != nil {
+		t.Fatalf("YesImpliedProbability(MaxFloat64, MaxFloat64): %v", err)
+	}
+	if got != 0.5 {
+		t.Fatalf("YesImpliedProbability(MaxFloat64, MaxFloat64) = %v, want 0.5", got)
+	}
+}
+
 func TestYesImpliedProbabilityRejectsInvalidReserves(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -91,6 +101,21 @@ func TestRecentTradeFlowImbalance(t *testing.T) {
 				t.Fatalf("RecentTradeFlowImbalance() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRecentTradeFlowImbalanceHandlesFiniteOverflowingTotals(t *testing.T) {
+	trades := []Trade{
+		{Direction: TradeYES, Amount: math.MaxFloat64},
+		{Direction: TradeYES, Amount: math.MaxFloat64},
+		{Direction: TradeNO, Amount: math.MaxFloat64},
+	}
+	got, err := RecentTradeFlowImbalance(trades)
+	if err != nil {
+		t.Fatalf("RecentTradeFlowImbalance(huge finite trades): %v", err)
+	}
+	if want := 1.0 / 3.0; got != want {
+		t.Fatalf("RecentTradeFlowImbalance(huge finite trades) = %v, want %v", got, want)
 	}
 }
 

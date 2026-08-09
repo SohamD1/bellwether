@@ -42,38 +42,55 @@ func YesImpliedProbability(yesReserve, noReserve float64) (float64, error) {
 	if !validReserve(yesReserve) || !validReserve(noReserve) {
 		return 0, ErrInvalidReserve
 	}
-	total := yesReserve + noReserve
-	if total <= 0 || math.IsInf(total, 0) {
-		return 0, ErrInvalidReserve
+	if total := yesReserve + noReserve; !math.IsInf(total, 0) {
+		if total == 0 {
+			return 0, ErrInvalidReserve
+		}
+		return noReserve / total, nil
 	}
-	return noReserve / total, nil
+	scale := math.Max(yesReserve, noReserve)
+	scaledYES := yesReserve / scale
+	scaledNO := noReserve / scale
+	return scaledNO / (scaledYES + scaledNO), nil
 }
 
 // RecentTradeFlowImbalance returns signed YES-minus-NO volume divided by
 // total absolute volume for the supplied event-count window. An empty window
 // has zero imbalance.
 func RecentTradeFlowImbalance(trades []Trade) (float64, error) {
-	var signed, total float64
+	var scale, rawYES, rawNO float64
+	useScaled := false
 	for _, trade := range trades {
 		if (trade.Direction != TradeYES && trade.Direction != TradeNO) ||
 			trade.Amount <= 0 || math.IsNaN(trade.Amount) || math.IsInf(trade.Amount, 0) {
 			return 0, ErrInvalidTrade
 		}
-
-		total += trade.Amount
+		scale = math.Max(scale, trade.Amount)
 		if trade.Direction == TradeYES {
-			signed += trade.Amount
+			rawYES += trade.Amount
+			useScaled = useScaled || math.IsInf(rawYES, 0)
 		} else {
-			signed -= trade.Amount
-		}
-		if math.IsInf(total, 0) || math.IsInf(signed, 0) {
-			return 0, ErrInvalidTrade
+			rawNO += trade.Amount
+			useScaled = useScaled || math.IsInf(rawNO, 0)
 		}
 	}
-	if total == 0 {
+	if scale == 0 {
 		return 0, nil
 	}
-	return signed / total, nil
+	if total := rawYES + rawNO; !useScaled && !math.IsInf(total, 0) {
+		return (rawYES - rawNO) / total, nil
+	}
+
+	var yesVolume, noVolume float64
+	for _, trade := range trades {
+		scaledAmount := trade.Amount / scale
+		if trade.Direction == TradeYES {
+			yesVolume += scaledAmount
+		} else {
+			noVolume += scaledAmount
+		}
+	}
+	return (yesVolume - noVolume) / (yesVolume + noVolume), nil
 }
 
 // LiquidityDepth returns the smaller outcome reserve. Reserves must be finite

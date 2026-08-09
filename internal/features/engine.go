@@ -13,8 +13,8 @@ var (
 	// ErrMarketMismatch reports input for a market other than the one assigned
 	// to the engine.
 	ErrMarketMismatch = errors.New("features: market mismatch")
-	// ErrEventOrder reports an update that is not strictly after the latest
-	// applied (block number, log index) position.
+	// ErrEventOrder reports an update that moves backward relative to the
+	// applied or already-observed position and timestamp frontier.
 	ErrEventOrder = errors.New("features: event out of order")
 	// ErrNoUpdates reports a snapshot request before any market update exists.
 	ErrNoUpdates = errors.New("features: no updates applied")
@@ -76,11 +76,13 @@ type flowEvent struct {
 // Engine maintains point-in-time feature state for exactly one market. It is
 // intentionally in-memory and is not safe for concurrent use.
 type Engine struct {
-	marketID   string
-	flowWindow int
-	flowEvents []flowEvent
-	latest     Update
-	hasUpdate  bool
+	marketID    string
+	flowWindow  int
+	flowEvents  []flowEvent
+	latest      Update
+	hasUpdate   bool
+	observed    SnapshotPoint
+	hasObserved bool
 }
 
 // NewEngine creates a single-market engine whose flow feature covers the
@@ -94,7 +96,9 @@ func NewEngine(marketID string, flowWindow int) (*Engine, error) {
 }
 
 // Apply validates and atomically incorporates update. Positions must be
-// strictly increasing in lexicographic (block number, log index) order.
+// strictly increasing in lexicographic (block number, log index) order,
+// timestamps may not move backward, and unseen updates may not enter at or
+// behind a position already emitted by Snapshot.
 func (e *Engine) Apply(update Update) error {
 	if update.MarketID != e.marketID {
 		return ErrMarketMismatch
@@ -109,6 +113,15 @@ func (e *Engine) Apply(update Update) error {
 		return err
 	}
 	if e.hasUpdate && !positionAfter(update.BlockNumber, update.LogIndex, e.latest.BlockNumber, e.latest.LogIndex) {
+		return ErrEventOrder
+	}
+	if e.hasUpdate && update.BlockTimestamp.Before(e.latest.BlockTimestamp) {
+		return ErrEventOrder
+	}
+	if e.hasObserved && !positionAfter(update.BlockNumber, update.LogIndex, e.observed.BlockNumber, e.observed.LogIndex) {
+		return ErrEventOrder
+	}
+	if e.hasObserved && update.BlockTimestamp.Before(e.observed.BlockTimestamp) {
 		return ErrEventOrder
 	}
 
@@ -148,6 +161,9 @@ func (e *Engine) Snapshot(point SnapshotPoint) (Snapshot, error) {
 	if positionAfter(e.latest.BlockNumber, e.latest.LogIndex, point.BlockNumber, point.LogIndex) {
 		return Snapshot{}, ErrSnapshotBeforeUpdate
 	}
+	if point.BlockTimestamp.Before(e.latest.BlockTimestamp) {
+		return Snapshot{}, ErrSnapshotBeforeUpdate
+	}
 
 	probability, err := YesImpliedProbability(e.latest.YesReserve, e.latest.NoReserve)
 	if err != nil {
@@ -172,7 +188,7 @@ func (e *Engine) Snapshot(point SnapshotPoint) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 
-	return Snapshot{
+	snapshot := Snapshot{
 		MarketID:                 point.MarketID,
 		BlockNumber:              point.BlockNumber,
 		LogIndex:                 point.LogIndex,
@@ -184,7 +200,9 @@ func (e *Engine) Snapshot(point SnapshotPoint) (Snapshot, error) {
 		LiquidityDepth:           depth,
 		SecondsToResolution:      SecondsToResolution(point.BlockTimestamp, e.latest.ResolutionTime),
 		BlockLag:                 lag,
-	}, nil
+	}
+	e.observe(point)
+	return snapshot, nil
 }
 
 // ReplayBatch replays each step through the same Apply and Snapshot methods
@@ -210,4 +228,16 @@ func ReplayBatch(marketID string, flowWindow int, steps []BatchStep) ([]Snapshot
 
 func positionAfter(block, log, otherBlock, otherLog uint64) bool {
 	return block > otherBlock || (block == otherBlock && log > otherLog)
+}
+
+func (e *Engine) observe(point SnapshotPoint) {
+	if !e.hasObserved || positionAfter(point.BlockNumber, point.LogIndex, e.observed.BlockNumber, e.observed.LogIndex) {
+		e.observed.BlockNumber = point.BlockNumber
+		e.observed.LogIndex = point.LogIndex
+	}
+	if !e.hasObserved || point.BlockTimestamp.After(e.observed.BlockTimestamp) {
+		e.observed.BlockTimestamp = point.BlockTimestamp
+	}
+	e.observed.MarketID = e.marketID
+	e.hasObserved = true
 }
