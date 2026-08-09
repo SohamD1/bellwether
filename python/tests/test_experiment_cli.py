@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -143,6 +144,22 @@ step_rows = 2
     for predictor in [*metrics["aggregate"], *metrics["folds"][0]["predictors"]]:
         assert set(predictor["scores"]) == {"brier", "log_loss"}
         assert len(predictor["reliability"]) == 5
+
+    root = Path(__file__).resolve().parents[2]
+    compatibility = subprocess.run(
+        [
+            "go",
+            "run",
+            "./cmd/bellwether-model-check",
+            "--model",
+            str(output_dirs[0] / "model.txt"),
+        ],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert compatibility.returncode == 0, compatibility.stderr
 
     ElementTree.fromstring((output_dirs[0] / "reliability.svg").read_text(encoding="utf-8"))
     model = (output_dirs[0] / "model.txt").read_text(encoding="utf-8")
