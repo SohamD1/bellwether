@@ -11,21 +11,28 @@ SPEC.loader.exec_module(DEV)
 
 
 def test_go_files_skips_local_worktrees_and_generated_outputs(tmp_path: Path) -> None:
-    included = tmp_path / "internal" / "keep.go"
+    included = [
+        tmp_path / "internal" / "keep.go",
+        tmp_path / "service" / "contracts" / "out" / "source.go",
+    ]
     excluded = [
         tmp_path / ".worktrees" / "feature" / "bad.go",
         tmp_path / ".pytest-tmp" / "bad.go",
         tmp_path / "contracts" / "lib" / "forge-std" / "bad.go",
         tmp_path / "contracts" / "cache" / "bad.go",
-        tmp_path / "nested" / "contracts" / "out" / "bad.go",
+        tmp_path / "contracts" / "out" / "bad.go",
         tmp_path / "contracts" / "broadcast" / "bad.go",
     ]
 
-    included.parent.mkdir(parents=True, exist_ok=True)
-    included.write_text("package included\n", encoding="utf-8")
+    for path in included:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("package included\n", encoding="utf-8")
 
     for path in excluded:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("package badly_formatted\n\nfunc f( ){ }\n", encoding="utf-8")
 
-    assert DEV.go_files(tmp_path) == [str(Path("internal") / "keep.go")]
+    assert DEV.go_files(tmp_path) == [
+        str(Path("internal") / "keep.go"),
+        str(Path("service") / "contracts" / "out" / "source.go"),
+    ]

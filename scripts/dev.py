@@ -21,11 +21,12 @@ def go_files(root: Path = ROOT) -> list[str]:
         relative = path.relative_to(root)
         if {".git", ".pytest-tmp", ".venv", ".worktrees"} & set(relative.parts):
             continue
-        if any(
-            relative.parts[index] == "contracts"
-            and relative.parts[index + 1] in {"broadcast", "cache", "lib", "out"}
-            for index in range(len(relative.parts) - 1)
-        ):
+        if relative.parts[:2] in {
+            ("contracts", "broadcast"),
+            ("contracts", "cache"),
+            ("contracts", "lib"),
+            ("contracts", "out"),
+        }:
             continue
         files.append(str(relative))
     return sorted(files)
