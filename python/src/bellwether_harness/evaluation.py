@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -39,7 +40,9 @@ class FoldEvaluation:
     boundaries: WalkForwardFold
     training_cutoff_ns: int
     eligible_train_rows: tuple[int, ...]
+    eligible_train_market_ids: tuple[str, ...]
     test_rows: tuple[int, ...]
+    test_market_ids: tuple[str, ...]
     predictors: tuple[PredictorEvaluation, ...]
 
 
@@ -63,10 +66,11 @@ def evaluate_walk_forward(
     """Fit fresh fold-local models and score future rows.
 
     At each fold, the training cutoff is the final training row's decision
-    timestamp. A candidate row is trainable only when its label resolution time
-    is no later than that cutoff. Test rows begin only after the configured
-    embargo. Features are consumed exactly as loaded; this function performs no
-    feature calculations, joins, calibration, or test-set fitting.
+    timestamp. A candidate row is trainable only when its canonical resolution
+    event made the label available no later than that cutoff. Test rows begin
+    only after the configured embargo. Features are consumed exactly as loaded;
+    this function performs no feature calculations, joins, calibration, or
+    test-set fitting.
     """
 
     specs = default_model_specs(seed=seed) if model_specs is None else model_specs
@@ -91,15 +95,21 @@ def evaluate_walk_forward(
             )
 
         candidates = np.arange(fold.train_start, fold.train_end, dtype=np.int64)
-        known = dataset.resolution_timestamps_ns[candidates] <= cutoff_ns
+        known = dataset.label_available_timestamps_ns[candidates] <= cutoff_ns
         eligible = candidates[known]
+        test_rows = np.arange(fold.test_start, fold.test_end, dtype=np.int64)
+        eligible_market_ids = _ordered_market_ids(dataset.market_ids[eligible])
+        test_market_ids = _ordered_market_ids(dataset.market_ids[test_rows])
+        overlap = set(eligible_market_ids) & set(test_market_ids)
+        if overlap:
+            raise ValueError(f"fold {fold_index} has train/test market overlap: {sorted(overlap)}")
+
         training_labels = dataset.outcomes[eligible]
         if len(np.unique(training_labels)) < 2:
             raise ValueError(
                 f"fold {fold_index} has one class after removing labels unknown at cutoff"
             )
 
-        test_rows = np.arange(fold.test_start, fold.test_end, dtype=np.int64)
         test_labels = dataset.outcomes[test_rows]
         fold_predictions: list[tuple[str, np.ndarray]] = [
             (MARKET_BASELINE_NAME, dataset.features[test_rows, 0])
@@ -107,14 +117,15 @@ def evaluate_walk_forward(
         for spec in specs:
             estimator = spec.build()
             estimator.fit(dataset.features[eligible], training_labels)
+            positive_class_index = _positive_class_index(estimator, spec.name)
             probabilities = np.asarray(
                 estimator.predict_proba(dataset.features[test_rows]), dtype=np.float64
             )
             if probabilities.shape != (len(test_rows), 2):
                 raise ValueError(
-                    f"model {spec.name!r} predict_proba must return two class probabilities"
+                    f"model {spec.name!r} predict_proba must return one column per class"
                 )
-            fold_predictions.append((spec.name, probabilities[:, 1]))
+            fold_predictions.append((spec.name, probabilities[:, positive_class_index]))
 
         predictors = tuple(
             _evaluate_predictor(
@@ -134,7 +145,9 @@ def evaluate_walk_forward(
                 boundaries=fold,
                 training_cutoff_ns=cutoff_ns,
                 eligible_train_rows=tuple(int(index) for index in eligible),
+                eligible_train_market_ids=eligible_market_ids,
                 test_rows=tuple(int(index) for index in test_rows),
+                test_market_ids=test_market_ids,
                 predictors=predictors,
             )
         )
@@ -153,6 +166,32 @@ def evaluate_walk_forward(
         folds=tuple(fold_results),
         aggregate=aggregate,
     )
+
+
+def _ordered_market_ids(values: np.ndarray) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(value) for value in values))
+
+
+def _positive_class_index(estimator: Any, model_name: str) -> int:
+    classes = np.asarray(getattr(estimator, "classes_", None))
+    if classes.ndim != 1 or len(classes) != 2:
+        raise ValueError(
+            f"model {model_name!r} classes_ must contain exactly binary classes {{0, 1}}"
+        )
+    try:
+        unique_classes = set(classes.tolist())
+    except TypeError as error:
+        raise ValueError(
+            f"model {model_name!r} classes_ must contain exactly binary classes {{0, 1}}"
+        ) from error
+    if unique_classes != {0, 1} or len(unique_classes) != len(classes):
+        raise ValueError(
+            f"model {model_name!r} classes_ must contain exactly binary classes {{0, 1}}"
+        )
+    matches = np.flatnonzero(classes == 1)
+    if len(matches) != 1:
+        raise ValueError(f"model {model_name!r} classes_ must contain class 1 exactly once")
+    return int(matches[0])
 
 
 def _validate_model_specs(specs: tuple[ModelSpec, ...]) -> None:

@@ -23,6 +23,7 @@ REQUIRED_COLUMNS = (
     "log_index",
     "block_timestamp",
     "resolution_timestamp",
+    "label_available_timestamp",
     "finality",
     *FEATURE_COLUMNS,
     "outcome",
@@ -36,6 +37,7 @@ class LabeledDataset:
     log_indices: npt.NDArray[np.uint64]
     block_timestamps_ns: npt.NDArray[np.int64]
     resolution_timestamps_ns: npt.NDArray[np.int64]
+    label_available_timestamps_ns: npt.NDArray[np.int64]
     finality: npt.NDArray[np.int32]
     features: npt.NDArray[np.float64]
     outcomes: npt.NDArray[np.int8]
@@ -52,10 +54,12 @@ def load_labeled_parquet(path: str | Path) -> LabeledDataset:
     _validate_schema(table)
     _validate_no_nulls(table)
 
+    market_ids = table["market_id"].combine_chunks().to_numpy(zero_copy_only=False)
     block_numbers = _integers(table, "block_number", np.uint64)
     log_indices = _integers(table, "log_index", np.uint64)
     block_timestamps_ns = _timestamps_ns(table["block_timestamp"])
     resolution_timestamps_ns = _timestamps_ns(table["resolution_timestamp"])
+    label_available_timestamps_ns = _timestamps_ns(table["label_available_timestamp"])
     finality = _integers(table, "finality", np.int32, allowed=(0, 1, 2))
     features = np.column_stack(
         [table[name].combine_chunks().to_numpy(zero_copy_only=False) for name in FEATURE_COLUMNS]
@@ -63,20 +67,23 @@ def load_labeled_parquet(path: str | Path) -> LabeledDataset:
     outcomes = _integers(table, "outcome", np.int8, allowed=(0, 1))
 
     _validate_values(
+        market_ids=market_ids,
         block_numbers=block_numbers,
         log_indices=log_indices,
         block_timestamps_ns=block_timestamps_ns,
         resolution_timestamps_ns=resolution_timestamps_ns,
+        label_available_timestamps_ns=label_available_timestamps_ns,
         finality=finality,
         features=features,
         outcomes=outcomes,
     )
     return LabeledDataset(
-        market_ids=table["market_id"].combine_chunks().to_numpy(zero_copy_only=False),
+        market_ids=market_ids,
         block_numbers=block_numbers,
         log_indices=log_indices,
         block_timestamps_ns=block_timestamps_ns,
         resolution_timestamps_ns=resolution_timestamps_ns,
+        label_available_timestamps_ns=label_available_timestamps_ns,
         finality=finality,
         features=features,
         outcomes=outcomes,
@@ -102,7 +109,11 @@ def _validate_schema(table: pa.Table) -> None:
     for name in ("block_number", "log_index", "finality", "block_lag"):
         if not pa.types.is_integer(schema.field(name).type):
             raise ValueError(f"dataset schema {name} must be integer")
-    for name in ("block_timestamp", "resolution_timestamp"):
+    for name in (
+        "block_timestamp",
+        "resolution_timestamp",
+        "label_available_timestamp",
+    ):
         field_type = schema.field(name).type
         if not pa.types.is_timestamp(field_type) or field_type.unit != "ns":
             raise ValueError(f"dataset schema {name} must be a nanosecond timestamp")
@@ -122,10 +133,12 @@ def _validate_no_nulls(table: pa.Table) -> None:
 
 def _validate_values(
     *,
+    market_ids: npt.NDArray[np.object_],
     block_numbers: npt.NDArray[np.uint64],
     log_indices: npt.NDArray[np.uint64],
     block_timestamps_ns: npt.NDArray[np.int64],
     resolution_timestamps_ns: npt.NDArray[np.int64],
+    label_available_timestamps_ns: npt.NDArray[np.int64],
     finality: npt.NDArray[np.int32],
     features: npt.NDArray[np.float64],
     outcomes: npt.NDArray[np.int8],
@@ -140,7 +153,33 @@ def _validate_values(
     if not np.isin(outcomes, (0, 1)).all():
         raise ValueError("outcome must be boolean, 0, or 1")
     if (resolution_timestamps_ns < block_timestamps_ns).any():
-        raise ValueError("resolution timestamp must not precede prediction timestamp")
+        raise ValueError("scheduled resolution timestamp must not precede prediction timestamp")
+
+    market_rows: dict[str, list[int]] = {}
+    for index, market_id in enumerate(market_ids):
+        if not isinstance(market_id, str) or not market_id.strip():
+            raise ValueError(f"market ID must not be empty at row {index}")
+        market_rows.setdefault(market_id, []).append(index)
+    for market_id, indexes in market_rows.items():
+        scheduled = {int(resolution_timestamps_ns[index]) for index in indexes}
+        available = {int(label_available_timestamps_ns[index]) for index in indexes}
+        market_outcomes = {int(outcomes[index]) for index in indexes}
+        if len(scheduled) != 1:
+            raise ValueError(f"market {market_id!r} has inconsistent scheduled resolution")
+        if len(available) != 1:
+            raise ValueError(f"market {market_id!r} has inconsistent label availability")
+        if len(market_outcomes) != 1:
+            raise ValueError(f"market {market_id!r} has inconsistent outcome")
+        scheduled_ns = next(iter(scheduled))
+        available_ns = next(iter(available))
+        if available_ns < scheduled_ns:
+            raise ValueError(
+                f"market {market_id!r} label availability precedes scheduled resolution"
+            )
+        if available_ns <= max(int(block_timestamps_ns[index]) for index in indexes):
+            raise ValueError(
+                f"market {market_id!r} label availability must be strictly after every prediction"
+            )
 
     for index in range(1, len(block_numbers)):
         previous = (int(block_numbers[index - 1]), int(log_indices[index - 1]))
