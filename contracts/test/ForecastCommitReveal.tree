@@ -18,6 +18,8 @@ revealForecast
 |   `-- it reverts with ZeroMarketId
 |-- when probabilityBps exceeds 10000
 |   `-- it reverts with ProbabilityOutOfRange
+|-- when modelRunId is zero
+|   `-- it reverts with ZeroModelRunId before reading commitment storage
 |-- when the caller has no commitment for the market
 |   |-- another caller cannot reveal someone else's commitment
 |   `-- it reverts with CommitmentNotFound

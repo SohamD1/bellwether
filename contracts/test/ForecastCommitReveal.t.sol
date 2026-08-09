@@ -190,6 +190,12 @@ contract ForecastCommitRevealTest is Test {
         registry.revealForecast(bytes32(0), PROBABILITY_BPS, MODEL_RUN_ID, SALT);
     }
 
+    function test_RevealForecast_RevertsWhenModelRunIdIsZeroBeforeCommitmentLookup() external {
+        vm.expectRevert(ForecastCommitReveal.ForecastCommitReveal__ZeroModelRunId.selector);
+        vm.prank(FORECASTER);
+        registry.revealForecast(MARKET_ID, PROBABILITY_BPS, bytes32(0), SALT);
+    }
+
     function test_RevealForecast_RevertsWhenCommitmentIsUnknown() external {
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -321,6 +327,7 @@ contract ForecastCommitRevealTest is Test {
 
     function testFuzz_RevealForecast_RejectsCorruptedModelRunId(bytes32 corruption) external {
         vm.assume(corruption != bytes32(0));
+        vm.assume(MODEL_RUN_ID ^ corruption != bytes32(0));
         _commitDefault(FORECASTER);
         vm.warp(RESOLUTION_TIME);
 

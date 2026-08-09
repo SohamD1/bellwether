@@ -38,6 +38,7 @@ contract ForecastCommitReveal {
 
     error ForecastCommitReveal__ZeroMarketId();
     error ForecastCommitReveal__ZeroCommitment();
+    error ForecastCommitReveal__ZeroModelRunId();
     error ForecastCommitReveal__InvalidResolutionTime(uint64 resolutionTime);
     error ForecastCommitReveal__CommitmentAlreadyExists(address forecaster, bytes32 marketId);
     error ForecastCommitReveal__CommitmentNotFound(address forecaster, bytes32 marketId);
@@ -81,6 +82,9 @@ contract ForecastCommitReveal {
         }
         if (probabilityBps > 10_000) {
             revert ForecastCommitReveal__ProbabilityOutOfRange(probabilityBps);
+        }
+        if (modelRunId == bytes32(0)) {
+            revert ForecastCommitReveal__ZeroModelRunId();
         }
 
         Commitment storage commitment = s_commitments[msg.sender][marketId];
