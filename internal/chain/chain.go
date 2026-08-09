@@ -126,3 +126,32 @@ func (s *Store) Reorg(branch []Block) ([]Block, error) {
 	s.blocks = append(s.blocks, branch...)
 	return dropped, nil
 }
+
+// Reconcile accepts an ascending candidate chain that may overlap the stored
+// chain. It finds the newest block shared by both chains and replaces only the
+// blocks above that ancestor. A candidate starting directly above a stored
+// ancestor is also accepted.
+func (s *Store) Reconcile(candidate []Block) ([]Block, error) {
+	if len(candidate) == 0 {
+		return nil, nil
+	}
+	for i := 1; i < len(candidate); i++ {
+		prev := candidate[i-1]
+		if candidate[i].Number != prev.Number+1 || candidate[i].Parent != prev.Hash {
+			return nil, ErrBrokenBranch
+		}
+	}
+
+	for i := len(candidate) - 1; i >= 0; i-- {
+		have, ok := s.ByNumber(candidate[i].Number)
+		if !ok || have.Hash != candidate[i].Hash {
+			continue
+		}
+		if i == len(candidate)-1 {
+			return nil, nil
+		}
+		return s.Reorg(candidate[i+1:])
+	}
+
+	return s.Reorg(candidate)
+}
