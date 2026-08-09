@@ -3,7 +3,12 @@ name = "bellwether-harness"
 version = "0.1.0"
 description = "Walk-forward training and evaluation harness for Bellwether"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "lightgbm>=4.6",
+    "numpy>=2.2",
+    "pyarrow>=19",
+    "scikit-learn>=1.6",
+]
 
 [dependency-groups]
 dev = [
@@ -20,6 +25,7 @@ packages = ["src/bellwether_harness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--basetemp=.pytest-tmp"
 
 [tool.ruff]
 line-length = 100

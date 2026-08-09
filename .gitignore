@@ -23,3 +23,14 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local agent worktrees
+.worktrees/
+
+.pytest-tmp/
+
+# Foundry
+/contracts/lib/
+/contracts/cache/
+/contracts/out/
+/contracts/broadcast/

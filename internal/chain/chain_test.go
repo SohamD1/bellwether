@@ -211,3 +211,74 @@ func TestReorgRejects(t *testing.T) {
 		})
 	}
 }
+
+func TestReconcileFindsNewestCommonAncestor(t *testing.T) {
+	s := seeded(t)
+	tip, _ := s.Tip()
+	orphaned := branch(tip, 2, 0xAA)
+	appendAll(t, s, orphaned)
+
+	known100, _ := s.ByNumber(100)
+	known101, _ := s.ByNumber(101)
+	replacement := branch(known101, 3, 0xBB)
+	candidate := append([]Block{known100, known101}, replacement...)
+
+	dropped, err := s.Reconcile(candidate)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !reflect.DeepEqual(dropped, orphaned) {
+		t.Fatalf("dropped = %+v, want %+v", dropped, orphaned)
+	}
+
+	clean := seeded(t)
+	appendAll(t, clean, replacement)
+	if !reflect.DeepEqual(s.Blocks(), clean.Blocks()) || s.State() != clean.State() {
+		t.Fatal("reconciled store differs from clean replay")
+	}
+}
+
+func TestReconcileExtendsFromKnownTip(t *testing.T) {
+	s := seeded(t)
+	tip, _ := s.Tip()
+	extension := branch(tip, 2, 0xCC)
+	candidate := append([]Block{tip}, extension...)
+
+	dropped, err := s.Reconcile(candidate)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if dropped != nil {
+		t.Fatalf("dropped = %+v, want nil", dropped)
+	}
+	if got, _ := s.Tip(); got.Hash != extension[len(extension)-1].Hash {
+		t.Fatalf("tip = %+v, want %+v", got, extension[len(extension)-1])
+	}
+}
+
+func TestReconcileRejectsInvalidCandidateWithoutMutation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		candidate []Block
+		want      error
+	}{
+		"unknown ancestor": {
+			candidate: []Block{blk(100, 9, 8), blk(101, 10, 9)},
+			want:      ErrUnknownAncestor,
+		},
+		"broken branch": {
+			candidate: []Block{blk(101, 2, 1), blk(102, 9, 8)},
+			want:      ErrBrokenBranch,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := seeded(t)
+			before, beforeState := s.Blocks(), s.State()
+			if _, err := s.Reconcile(tc.candidate); !errors.Is(err, tc.want) {
+				t.Fatalf("Reconcile = %v, want %v", err, tc.want)
+			}
+			if !reflect.DeepEqual(s.Blocks(), before) || s.State() != beforeState {
+				t.Fatal("rejected candidate mutated the store")
+			}
+		})
+	}
+}
