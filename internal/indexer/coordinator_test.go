@@ -612,6 +612,94 @@ func headerResult(header *types.Header) func(context.Context) (*types.Header, er
 	return func(context.Context) (*types.Header, error) { return cloneHeader(header), nil }
 }
 
+func TestCoordinatorBackfillRetryRefreshesFinalityWithoutDuplicatingCommittedData(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+	mismatchedSafe := types.CopyHeader(headers[11])
+	mismatchedSafe.Extra = []byte{0xff}
+	reader := &fakeBlockReader{
+		headers:     headers,
+		latest:      headers[12],
+		logs:        map[common.Hash][]types.Log{headers[11].Hash(): {rpcLog(headers[11], 0, 1)}},
+		safeResult:  headerResult(mismatchedSafe),
+		finalResult: headerResult(headers[10]),
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	if err := coordinator.Backfill(context.Background()); !errors.Is(err, ErrDisconnectedBranch) {
+		t.Fatalf("Backfill = %v, want post-commit ErrDisconnectedBranch", err)
+	}
+	committedBlocks := store.Blocks()
+	committedState := store.State()
+	if len(committedBlocks) != 3 {
+		t.Fatalf("failed refresh left %d blocks, want 3 committed blocks", len(committedBlocks))
+	}
+	if len(committedBlocks[1].Events) != 1 {
+		t.Fatalf("failed refresh left %d events in block 11, want 1 committed event", len(committedBlocks[1].Events))
+	}
+	assertNoFinality(t, store)
+
+	reader.safeResult = headerResult(headers[11])
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("retry Backfill: %v", err)
+	}
+	if !reflect.DeepEqual(store.Blocks(), committedBlocks) || store.State() != committedState {
+		t.Fatal("retry duplicated or replayed already committed canonical data")
+	}
+	safe, hasSafe := store.Checkpoint(chain.FinalitySafe)
+	finalized, hasFinalized := store.Checkpoint(chain.FinalityFinalized)
+	if !hasSafe || safe.Number != 11 || !hasFinalized || finalized.Number != 10 {
+		t.Fatalf("retry checkpoints = safe %+v/%v finalized %+v/%v, want 11 and 10", safe, hasSafe, finalized, hasFinalized)
+	}
+}
+
+func TestCoordinatorLiveRetryRefreshesFinalityWithoutDuplicatingCommittedHead(t *testing.T) {
+	t.Parallel()
+
+	headers := linearHeaders(10, 13, common.Hash{0x99}, 0x01)
+	reader := &fakeBlockReader{
+		headers: headers,
+		latest:  headers[12],
+		logs:    map[common.Hash][]types.Log{headers[13].Hash(): {rpcLog(headers[13], 0, 1)}},
+	}
+	store := new(chain.Store)
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+	if err := coordinator.Backfill(context.Background()); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	providerErr := errors.New("finalized checkpoint unavailable")
+	reader.safeResult = headerResult(headers[12])
+	reader.finalResult = func(context.Context) (*types.Header, error) { return nil, providerErr }
+
+	if err := coordinator.ingestHead(context.Background(), headers[13]); !errors.Is(err, providerErr) {
+		t.Fatalf("ingestHead = %v, want post-commit provider error", err)
+	}
+	committedBlocks := store.Blocks()
+	committedState := store.State()
+	if len(committedBlocks) != 4 {
+		t.Fatalf("failed refresh left %d blocks, want 4 committed blocks", len(committedBlocks))
+	}
+	if len(committedBlocks[3].Events) != 1 {
+		t.Fatalf("failed refresh left %d events in block 13, want 1 committed event", len(committedBlocks[3].Events))
+	}
+	assertNoFinality(t, store)
+
+	reader.finalResult = headerResult(headers[11])
+	if err := coordinator.ingestHead(context.Background(), headers[13]); err != nil {
+		t.Fatalf("retry duplicate ingestHead: %v", err)
+	}
+	if !reflect.DeepEqual(store.Blocks(), committedBlocks) || store.State() != committedState {
+		t.Fatal("retry duplicated or reconciled the already committed live head")
+	}
+	safe, hasSafe := store.Checkpoint(chain.FinalitySafe)
+	finalized, hasFinalized := store.Checkpoint(chain.FinalityFinalized)
+	if !hasSafe || safe.Number != 12 || !hasFinalized || finalized.Number != 11 {
+		t.Fatalf("retry checkpoints = safe %+v/%v finalized %+v/%v, want 12 and 11", safe, hasSafe, finalized, hasFinalized)
+	}
+}
+
 func TestCoordinatorBackfillRefreshesBaseFinalityCheckpoints(t *testing.T) {
 	t.Parallel()
 

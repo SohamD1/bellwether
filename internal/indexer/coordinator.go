@@ -18,8 +18,12 @@ var (
 	// ErrInvalidCoordinatorConfig reports a coordinator dependency or bound
 	// that cannot make deterministic progress.
 	ErrInvalidCoordinatorConfig = errors.New("indexer: invalid coordinator configuration")
-	// ErrDisconnectedBranch reports headers or logs that do not form the
-	// announced branch. Canonical state is not changed in this case.
+	// ErrDisconnectedBranch reports headers, logs, or finality checkpoints that
+	// do not match the canonical branch. Block assembly and reconciliation
+	// failures occur before mutation. A finality-refresh failure may be returned
+	// after a block or reorg commit; that canonical commit remains durable, the
+	// checkpoint pair itself is atomic, and idempotently retrying the same
+	// ingestion retries the refresh.
 	ErrDisconnectedBranch = errors.New("indexer: disconnected branch")
 	// ErrHeaderSubscriptionClosed reports a live head subscription that ended
 	// without a provider error or caller cancellation.
