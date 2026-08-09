@@ -18,6 +18,174 @@ type extraLabeledParquetRow struct {
 	FutureOutcomeHint int32 `parquet:"future_outcome_hint"`
 }
 
+type nullableLabeledParquetRow struct {
+	MarketID                 string   `parquet:"market_id"`
+	BlockNumber              uint64   `parquet:"block_number"`
+	LogIndex                 uint64   `parquet:"log_index"`
+	BlockTimestamp           int64    `parquet:"block_timestamp,timestamp(nanosecond)"`
+	ResolutionTimestamp      int64    `parquet:"resolution_timestamp,timestamp(nanosecond)"`
+	LabelAvailableTimestamp  int64    `parquet:"label_available_timestamp,timestamp(nanosecond)"`
+	Finality                 int32    `parquet:"finality"`
+	YesImpliedProbability    *float64 `parquet:"yes_implied_probability"`
+	RecentTradeFlowImbalance float64  `parquet:"recent_trade_flow_imbalance"`
+	LiquidityDepth           float64  `parquet:"liquidity_depth"`
+	SecondsToResolution      float64  `parquet:"seconds_to_resolution"`
+	BlockLag                 uint64   `parquet:"block_lag"`
+	Outcome                  *bool    `parquet:"outcome"`
+}
+
+type repeatedOutcomeParquetRow struct {
+	MarketID                 string  `parquet:"market_id"`
+	BlockNumber              uint64  `parquet:"block_number"`
+	LogIndex                 uint64  `parquet:"log_index"`
+	BlockTimestamp           int64   `parquet:"block_timestamp,timestamp(nanosecond)"`
+	ResolutionTimestamp      int64   `parquet:"resolution_timestamp,timestamp(nanosecond)"`
+	LabelAvailableTimestamp  int64   `parquet:"label_available_timestamp,timestamp(nanosecond)"`
+	Finality                 int32   `parquet:"finality"`
+	YesImpliedProbability    float64 `parquet:"yes_implied_probability"`
+	RecentTradeFlowImbalance float64 `parquet:"recent_trade_flow_imbalance"`
+	LiquidityDepth           float64 `parquet:"liquidity_depth"`
+	SecondsToResolution      float64 `parquet:"seconds_to_resolution"`
+	BlockLag                 uint64  `parquet:"block_lag"`
+	Outcome                  []bool  `parquet:"outcome"`
+}
+
+func TestCompatibleParquetTypeAllowsNanosecondsRegardlessUTCFlag(t *testing.T) {
+	t.Parallel()
+
+	utc := parquet.TimestampAdjusted(parquet.Nanosecond, true).Type()
+	local := parquet.TimestampAdjusted(parquet.Nanosecond, false).Type()
+	micros := parquet.TimestampAdjusted(parquet.Microsecond, false).Type()
+	if !compatibleParquetType("block_timestamp", utc, local) {
+		t.Fatal("nanosecond timestamps with different UTC flags are incompatible")
+	}
+	if compatibleParquetType("block_timestamp", utc, micros) {
+		t.Fatal("nanosecond timestamp accepted a microsecond timestamp")
+	}
+	if !compatibleParquetType("finality", parquet.Int32Type, parquet.Int(32).Type()) {
+		t.Fatal("plain PyArrow int32 is incompatible with signed int32 finality")
+	}
+	if compatibleParquetType("finality", parquet.Uint(32).Type(), parquet.Int(32).Type()) {
+		t.Fatal("unsigned int32 accepted for signed finality")
+	}
+}
+
+func TestReadParquetRejectsNullRequiredValuesBeforeTypedConversion(t *testing.T) {
+	t.Parallel()
+
+	base, _ := nullableTestRow(t)
+	tests := []struct {
+		name   string
+		mutate func(*nullableLabeledParquetRow)
+	}{
+		{name: "null outcome", mutate: func(row *nullableLabeledParquetRow) { row.Outcome = nil }},
+		{name: "null floating feature", mutate: func(row *nullableLabeledParquetRow) { row.YesImpliedProbability = nil }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			row := base
+			tt.mutate(&row)
+			path := filepath.Join(t.TempDir(), "nullable.parquet")
+			writeNullableRowGroups(t, path, base, row)
+			if got, err := ReadParquet(path); !errors.Is(err, ErrNullValue) {
+				t.Fatalf("ReadParquet = %#v, %v, want ErrNullValue", got, err)
+			}
+		})
+	}
+}
+
+func TestReadParquetAllowsOptionalColumnsWhenEveryValueIsPresent(t *testing.T) {
+	t.Parallel()
+
+	row, want := nullableTestRow(t)
+	path := filepath.Join(t.TempDir(), "optional-non-null.parquet")
+	if err := parquet.WriteFile(path, []nullableLabeledParquetRow{row}); err != nil {
+		t.Fatalf("write optional Parquet: %v", err)
+	}
+	got, err := ReadParquet(path)
+	if err != nil {
+		t.Fatalf("ReadParquet: %v", err)
+	}
+	if !reflect.DeepEqual(got, []LabeledRow{want}) {
+		t.Fatalf("ReadParquet = %#v, want %#v", got, []LabeledRow{want})
+	}
+}
+
+func TestReadParquetRejectsRepeatedRequiredColumn(t *testing.T) {
+	t.Parallel()
+
+	snapshots, labels := testInputs()
+	rows, err := Assemble(snapshots[:1], map[string]ResolutionLabel{"market-a": labels["market-a"]})
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	base := toParquetRows(rows)[0]
+	repeated := repeatedOutcomeParquetRow{
+		MarketID: base.MarketID, BlockNumber: base.BlockNumber, LogIndex: base.LogIndex,
+		BlockTimestamp: base.BlockTimestamp, ResolutionTimestamp: base.ResolutionTimestamp,
+		LabelAvailableTimestamp: base.LabelAvailableTimestamp, Finality: base.Finality,
+		YesImpliedProbability: base.YesImpliedProbability, RecentTradeFlowImbalance: base.RecentTradeFlowImbalance,
+		LiquidityDepth: base.LiquidityDepth, SecondsToResolution: base.SecondsToResolution,
+		BlockLag: base.BlockLag, Outcome: []bool{base.Outcome},
+	}
+	path := filepath.Join(t.TempDir(), "repeated.parquet")
+	if err := parquet.WriteFile(path, []repeatedOutcomeParquetRow{repeated}); err != nil {
+		t.Fatalf("write repeated Parquet: %v", err)
+	}
+	if _, err := ReadParquet(path); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("ReadParquet error = %v, want ErrSchemaMismatch", err)
+	}
+}
+
+func writeNullableRowGroups(t *testing.T, path string, groups ...nullableLabeledParquetRow) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create nullable Parquet: %v", err)
+	}
+	writer := parquet.NewGenericWriter[nullableLabeledParquetRow](file)
+	for i := range groups {
+		if _, err := writer.Write(groups[i : i+1]); err != nil {
+			_ = writer.Close()
+			_ = file.Close()
+			t.Fatalf("write nullable row group %d: %v", i, err)
+		}
+		if err := writer.Flush(); err != nil {
+			_ = writer.Close()
+			_ = file.Close()
+			t.Fatalf("flush nullable row group %d: %v", i, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		_ = file.Close()
+		t.Fatalf("close nullable writer: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close nullable file: %v", err)
+	}
+}
+
+func nullableTestRow(t *testing.T) (nullableLabeledParquetRow, LabeledRow) {
+	t.Helper()
+	snapshots, labels := testInputs()
+	rows, err := Assemble(snapshots[:1], map[string]ResolutionLabel{"market-a": labels["market-a"]})
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	want := rows[0]
+	base := toParquetRows(rows)[0]
+	probability, outcome := base.YesImpliedProbability, base.Outcome
+	return nullableLabeledParquetRow{
+		MarketID: base.MarketID, BlockNumber: base.BlockNumber, LogIndex: base.LogIndex,
+		BlockTimestamp: base.BlockTimestamp, ResolutionTimestamp: base.ResolutionTimestamp,
+		LabelAvailableTimestamp: base.LabelAvailableTimestamp, Finality: base.Finality,
+		YesImpliedProbability: &probability, RecentTradeFlowImbalance: base.RecentTradeFlowImbalance,
+		LiquidityDepth: base.LiquidityDepth, SecondsToResolution: base.SecondsToResolution,
+		BlockLag: base.BlockLag, Outcome: &outcome,
+	}, want
+}
+
 func TestReadParquetRejectsColumnsOutsideExactSchema(t *testing.T) {
 	t.Parallel()
 

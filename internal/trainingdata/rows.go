@@ -28,6 +28,7 @@ var (
 	ErrNonFinite                  = errors.New("trainingdata: non-finite feature value")
 	ErrProbabilityRange           = errors.New("trainingdata: implied probability outside [0,1]")
 	ErrSchemaMismatch             = errors.New("trainingdata: Parquet schema mismatch")
+	ErrNullValue                  = errors.New("trainingdata: null required Parquet value")
 )
 
 // ResolutionLabel records the market schedule and canonical time at which the

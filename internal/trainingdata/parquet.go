@@ -2,6 +2,7 @@ package trainingdata
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -152,9 +153,79 @@ func validateParquetSchema(path string) error {
 		}
 		gotLeaf, gotOK := got.Lookup(gotColumns[i]...)
 		wantLeaf, wantOK := want.Lookup(wantColumns[i]...)
-		if !gotOK || !wantOK || gotLeaf.Node.Type().String() != wantLeaf.Node.Type().String() {
+		if !gotOK || !wantOK || !compatibleParquetType(wantColumns[i][0], gotLeaf.Node.Type(), wantLeaf.Node.Type()) {
 			return fmt.Errorf("%w at column %q", ErrSchemaMismatch, wantColumns[i])
+		}
+		if gotLeaf.MaxRepetitionLevel != 0 {
+			return fmt.Errorf("%w: repeated column %q", ErrSchemaMismatch, gotColumns[i])
+		}
+		// PyArrow marks fields optional by default. Accept that representation
+		// only because validateNoNulls checks every row group before conversion.
+	}
+	if err := validateNoNulls(parquetFile); err != nil {
+		return err
+	}
+	return nil
+}
+
+func compatibleParquetType(column string, got, want parquet.Type) bool {
+	if got.String() == want.String() {
+		return true
+	}
+	gotLogical, wantLogical := got.LogicalType(), want.LogicalType()
+	if column == "finality" && got.Kind() == parquet.Int32 && want.Kind() == parquet.Int32 {
+		return gotLogical == nil ||
+			(gotLogical.Integer != nil && gotLogical.Integer.BitWidth == 32 && gotLogical.Integer.IsSigned)
+	}
+	return got.Kind() == parquet.Int64 && want.Kind() == parquet.Int64 &&
+		gotLogical != nil && wantLogical != nil &&
+		gotLogical.Timestamp != nil && wantLogical.Timestamp != nil &&
+		gotLogical.Timestamp.Unit.Nanos != nil && wantLogical.Timestamp.Unit.Nanos != nil
+}
+
+func validateNoNulls(file *parquet.File) error {
+	columns := file.Schema().Columns()
+	for rowGroupIndex, rowGroup := range file.RowGroups() {
+		chunks := rowGroup.ColumnChunks()
+		if len(chunks) != len(columns) {
+			return fmt.Errorf("%w in row group %d", ErrSchemaMismatch, rowGroupIndex)
+		}
+		for columnIndex, chunk := range chunks {
+			if counter, ok := chunk.(interface{ NullCount() int64 }); ok && counter.NullCount() > 0 {
+				return fmt.Errorf("%w in row group %d column %q", ErrNullValue, rowGroupIndex, columns[columnIndex])
+			}
+			leaf, ok := file.Schema().Lookup(columns[columnIndex]...)
+			if !ok {
+				return fmt.Errorf("%w at column %q", ErrSchemaMismatch, columns[columnIndex])
+			}
+			pages := chunk.Pages()
+			for {
+				page, err := pages.ReadPage()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					_ = pages.Close()
+					return fmt.Errorf("trainingdata: read row group %d column %q: %w", rowGroupIndex, columns[columnIndex], err)
+				}
+				if page.NumNulls() > 0 || hasNullDefinitionLevel(page.DefinitionLevels(), leaf.MaxDefinitionLevel) {
+					_ = pages.Close()
+					return fmt.Errorf("%w in row group %d column %q", ErrNullValue, rowGroupIndex, columns[columnIndex])
+				}
+			}
+			if err := pages.Close(); err != nil {
+				return fmt.Errorf("trainingdata: close row group %d column %q: %w", rowGroupIndex, columns[columnIndex], err)
+			}
 		}
 	}
 	return nil
+}
+
+func hasNullDefinitionLevel(levels []byte, maximum int) bool {
+	for _, level := range levels {
+		if int(level) < maximum {
+			return true
+		}
+	}
+	return false
 }
