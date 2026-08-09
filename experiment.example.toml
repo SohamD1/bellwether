@@ -1,0 +1,9 @@
+# SYNTHETIC FIXTURE DATA ONLY. Results are demonstrations, not real-world evidence.
+seed = 7
+reliability_bin_count = 10
+
+[split]
+initial_train_rows = 24
+embargo_rows = 6
+test_rows = 6
+step_rows = 6

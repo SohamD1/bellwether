@@ -1,0 +1,4 @@
+run
+`-- when called by a Foundry script runner
+    |-- it should deploy BellwetherMarketFixture
+    `-- it should deploy ForecastCommitReveal
