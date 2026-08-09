@@ -107,8 +107,9 @@ func (c *Coordinator) Run(ctx context.Context) error {
 }
 
 // Backfill indexes every header from StartBlock through the provider's sealed
-// latest header. Each bounded range is fully assembled and validated before
-// its blocks are committed in ascending order.
+// latest header. RPC requests remain range-bounded, but the complete captured
+// interval is staged in memory and cross-range linkage is validated before one
+// append or reconciliation mutates the store.
 func (c *Coordinator) Backfill(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -125,20 +126,14 @@ func (c *Coordinator) Backfill(ctx context.Context) error {
 		return nil
 	}
 
-	var replacementBranch []chain.Block
+	var candidate []chain.Block
 	for from := c.config.StartBlock; ; {
 		to := boundedEnd(from, c.config.BackfillMaxRange, latestNumber)
-		candidate, err := c.buildBackfillRange(ctx, from, to)
+		rangeBlocks, err := c.buildBackfillRange(ctx, from, to)
 		if err != nil {
 			return err
 		}
-		if replacementBranch != nil {
-			replacementBranch = append(replacementBranch, candidate...)
-		} else if c.requiresReconcile(candidate) {
-			replacementBranch = append([]chain.Block(nil), candidate...)
-		} else if err := c.commitCandidate(candidate); err != nil {
-			return err
-		}
+		candidate = append(candidate, rangeBlocks...)
 		if to == latestNumber {
 			break
 		}
@@ -147,7 +142,7 @@ func (c *Coordinator) Backfill(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return c.commitCandidate(replacementBranch)
+	return c.commitCandidate(candidate)
 }
 
 func (c *Coordinator) buildBackfillRange(ctx context.Context, from, to uint64) ([]chain.Block, error) {
@@ -161,6 +156,9 @@ func (c *Coordinator) buildBackfillRange(ctx context.Context, from, to uint64) (
 	}
 	logsByNumber := make(map[uint64][]base.Log)
 	if err := backfiller.Backfill(ctx, func(log base.Log) error {
+		if log.BlockNumber < from || log.BlockNumber > to {
+			return fmt.Errorf("%w: log block %d outside requested range %d-%d", ErrDisconnectedBranch, log.BlockNumber, from, to)
+		}
 		logsByNumber[log.BlockNumber] = append(logsByNumber[log.BlockNumber], log)
 		return nil
 	}); err != nil {
@@ -396,22 +394,6 @@ func (c *Coordinator) commitCandidate(candidate []chain.Block) error {
 		return nil
 	}
 	return nil
-}
-
-func (c *Coordinator) requiresReconcile(candidate []chain.Block) bool {
-	tip, hasTip := c.store.Tip()
-	for _, block := range candidate {
-		if stored, ok := c.store.ByNumber(block.Number); ok && stored.Hash == block.Hash {
-			continue
-		}
-		if !hasTip || (block.Number == tip.Number+1 && block.Parent == tip.Hash) {
-			tip = block
-			hasTip = true
-			continue
-		}
-		return true
-	}
-	return false
 }
 
 func (c *Coordinator) resync(headNumber uint64) error {

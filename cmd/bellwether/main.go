@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/SohamD1/bellwether/internal/base"
@@ -28,10 +30,35 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stderr io.Writer) error {
+	return runWithDial(ctx, args, stderr, dialEthClient)
+}
+
+type rpcDialFunc func(context.Context, string) (base.EthBackend, error)
+
+type rpcDiagnosticError struct {
+	operation string
+	hosts     string
+	cause     error
+}
+
+func (e *rpcDiagnosticError) Error() string {
+	return fmt.Sprintf("%s (%s): RPC request failed", e.operation, e.hosts)
+}
+
+func (e *rpcDiagnosticError) Unwrap() error { return e.cause }
+
+func dialEthClient(ctx context.Context, endpoint string) (base.EthBackend, error) {
+	return ethclient.DialContext(ctx, endpoint)
+}
+
+func runWithDial(ctx context.Context, args []string, stderr io.Writer, dial rpcDialFunc) error {
 	flags := flag.NewFlagSet("bellwether", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "config.toml", "path to the Bellwether TOML configuration")
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	if flags.NArg() != 0 {
@@ -46,9 +73,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		return nil
 	}
 
-	httpRPC, err := ethclient.DialContext(ctx, settings.HTTPRPCURL)
+	httpRPC, err := dial(ctx, settings.HTTPRPCURL)
 	if err != nil {
-		return fmt.Errorf("dial HTTP RPC: %w", err)
+		if ctx.Err() != nil {
+			return nil
+		}
+		return safeRPCError("dial HTTP RPC", err, settings.HTTPRPCURL)
 	}
 	httpClient, err := base.NewEthClient(httpRPC)
 	if err != nil {
@@ -57,9 +87,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	defer httpClient.Close()
 
-	wsRPC, err := ethclient.DialContext(ctx, settings.WebSocketRPCURL)
+	wsRPC, err := dial(ctx, settings.WebSocketRPCURL)
 	if err != nil {
-		return fmt.Errorf("dial WebSocket RPC: %w", err)
+		if ctx.Err() != nil {
+			return nil
+		}
+		return safeRPCError("dial WebSocket RPC", err, settings.WebSocketRPCURL)
 	}
 	wsClient, err := base.NewEthClient(wsRPC)
 	if err != nil {
@@ -88,18 +121,42 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 
 	fmt.Fprintf(stderr, "bellwether: backfilling from block %d\n", settings.StartBlock)
 	if err := coordinator.Backfill(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil {
 			return nil
 		}
-		return err
+		return safeRPCError("backfill", err, settings.HTTPRPCURL)
 	}
 	if tip, ok := store.Tip(); ok {
 		fmt.Fprintf(stderr, "bellwether: backfill complete at block %d; following live heads\n", tip.Number)
 	} else {
 		fmt.Fprintln(stderr, "bellwether: no sealed blocks in configured range; following live heads")
 	}
-	if err := coordinator.RunLive(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	if err := coordinator.RunLive(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return safeRPCError("live indexing", err, settings.HTTPRPCURL, settings.WebSocketRPCURL)
 	}
 	return nil
+}
+
+func safeRPCError(operation string, cause error, endpoints ...string) error {
+	hosts := make([]string, 0, len(endpoints))
+	seen := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		parsed, err := url.Parse(endpoint)
+		if err != nil || parsed.Hostname() == "" {
+			continue
+		}
+		host := parsed.Hostname()
+		if _, exists := seen[host]; exists {
+			continue
+		}
+		seen[host] = struct{}{}
+		hosts = append(hosts, host)
+	}
+	if len(hosts) == 0 {
+		hosts = append(hosts, "configured RPC host")
+	}
+	return &rpcDiagnosticError{operation: operation, hosts: strings.Join(hosts, ", "), cause: cause}
 }

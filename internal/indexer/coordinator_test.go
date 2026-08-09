@@ -30,6 +30,40 @@ type cancelingBlockReader struct {
 	cancel context.CancelFunc
 }
 
+type flippingBlockReader struct {
+	first   map[uint64]*types.Header
+	second  map[uint64]*types.Header
+	latest  *types.Header
+	flipped bool
+}
+
+func (f *flippingBlockReader) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	if number == nil {
+		return cloneHeader(f.latest), nil
+	}
+	headers := f.first
+	if f.flipped {
+		headers = f.second
+	}
+	return cloneHeader(headers[number.Uint64()]), nil
+}
+
+func (f *flippingBlockReader) FilterLogs(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
+	if query.FromBlock.Uint64() >= 13 {
+		f.flipped = true
+	}
+	return nil, nil
+}
+
+type rangeViolatingReader struct {
+	*fakeBlockReader
+	log types.Log
+}
+
+func (f *rangeViolatingReader) FilterLogs(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
+	return []types.Log{f.log}, nil
+}
+
 func (f *cancelingBlockReader) FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
 	logs, err := f.fakeBlockReader.FilterLogs(ctx, query)
 	f.cancel()
@@ -153,7 +187,7 @@ func testCoordinatorConfig(start, depth uint64) CoordinatorConfig {
 	}
 }
 
-func newTestCoordinator(t *testing.T, reader *fakeBlockReader, subscriber *fakeHeadSubscriber, store *chain.Store, config CoordinatorConfig) *Coordinator {
+func newTestCoordinator(t *testing.T, reader BlockReader, subscriber *fakeHeadSubscriber, store *chain.Store, config CoordinatorConfig) *Coordinator {
 	t.Helper()
 	coordinator, err := NewCoordinator(reader, subscriber, fakeDecoder{}, store, config)
 	if err != nil {
@@ -212,6 +246,66 @@ func TestCoordinatorBackfillGroupsHeadersAndLogsIntoCompleteAscendingBlocks(t *t
 	}
 	if store.Len() != 3 {
 		t.Fatalf("duplicate backfill grew store to %d blocks", store.Len())
+	}
+}
+
+func TestCoordinatorBackfillDoesNotMutateBeforeCrossRangeLinkageValidates(t *testing.T) {
+	t.Parallel()
+
+	baseHeader := testHeader(9, common.Hash{0x98}, 0x01)
+	first := linearHeaders(10, 14, baseHeader.Hash(), 0x02)
+	second := linearHeaders(10, 14, baseHeader.Hash(), 0x03)
+	reader := &flippingBlockReader{first: first, second: second, latest: first[14]}
+	store := new(chain.Store)
+	if err := store.Append(chain.Block{
+		Number: 9,
+		Hash:   chain.Hash(baseHeader.Hash()),
+		Parent: chain.Hash(baseHeader.ParentHash),
+		Events: []chain.Event{{Kind: "seed", Data: []byte("unchanged")}},
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	beforeBlocks, beforeState := store.Blocks(), store.State()
+	coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+	err := coordinator.Backfill(context.Background())
+	if !errors.Is(err, ErrDisconnectedBranch) {
+		t.Fatalf("Backfill = %v, want ErrDisconnectedBranch", err)
+	}
+	if !reflect.DeepEqual(store.Blocks(), beforeBlocks) || store.State() != beforeState {
+		t.Fatal("cross-range provider view change mutated canonical blocks or state")
+	}
+}
+
+func TestCoordinatorBackfillRejectsLogsOutsideRequestedRangeBeforeMutation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		blockNumber uint64
+	}{
+		{name: "below range", blockNumber: 9},
+		{name: "above range", blockNumber: 13},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			headers := linearHeaders(10, 12, common.Hash{0x99}, 0x01)
+			reader := &rangeViolatingReader{
+				fakeBlockReader: &fakeBlockReader{headers: headers, latest: headers[12], logs: make(map[common.Hash][]types.Log)},
+				log:             types.Log{BlockNumber: tt.blockNumber},
+			}
+			store := new(chain.Store)
+			coordinator := newTestCoordinator(t, reader, &fakeHeadSubscriber{}, store, testCoordinatorConfig(10, 4))
+
+			err := coordinator.Backfill(context.Background())
+			if !errors.Is(err, ErrDisconnectedBranch) {
+				t.Fatalf("Backfill = %v, want ErrDisconnectedBranch", err)
+			}
+			if store.Len() != 0 || store.State() != (chain.State{}) {
+				t.Fatalf("out-of-range log mutated store: blocks=%d state=%+v", store.Len(), store.State())
+			}
+		})
 	}
 }
 
