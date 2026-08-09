@@ -3,9 +3,11 @@ package indexer
 import (
 	"errors"
 	"math/big"
+	"reflect"
 	"testing"
 
 	"github.com/SohamD1/bellwether/internal/base"
+	"github.com/SohamD1/bellwether/internal/chain"
 	"github.com/SohamD1/bellwether/internal/market"
 )
 
@@ -46,6 +48,61 @@ func TestConvertEventPreservesUint256ValuesDeterministically(t *testing.T) {
 	}
 	if string(got.Data) != want {
 		t.Fatal("previous serialization aliased caller-owned integers")
+	}
+}
+
+func TestCanonicalEventRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []market.Event{
+		market.Trade{
+			MarketID: base.Hash{0x01}, Trader: base.Address{0x02}, Yes: true,
+			Amount: big.NewInt(3), YesReserve: big.NewInt(40), NoReserve: big.NewInt(60),
+			ResolutionTime: 1_786_294_800,
+		},
+		market.LiquidityChanged{
+			MarketID: base.Hash{0x04}, YesReserve: big.NewInt(45), NoReserve: big.NewInt(55),
+			ResolutionTime: 1_786_294_900,
+		},
+		market.MarketResolved{MarketID: base.Hash{0x05}, Outcome: true},
+	}
+	for _, want := range tests {
+		want := want
+		t.Run(reflect.TypeOf(want).Name(), func(t *testing.T) {
+			t.Parallel()
+			encoded, err := ConvertEvent(want)
+			if err != nil {
+				t.Fatalf("ConvertEvent: %v", err)
+			}
+			got, err := DecodeEvent(encoded)
+			if err != nil {
+				t.Fatalf("DecodeEvent: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("round trip = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestDecodeEventRejectsMalformedCanonicalPayload(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		event chain.Event
+	}{
+		{name: "unknown kind", event: chain.Event{Kind: "unknown", Data: []byte(`{}`)}},
+		{name: "unknown field", event: chain.Event{Kind: "market_resolved", Data: []byte(`{"market_id":"0x0000000000000000000000000000000000000000000000000000000000000000","outcome":true,"extra":1}`)}},
+		{name: "short market ID", event: chain.Event{Kind: "market_resolved", Data: []byte(`{"market_id":"0x01","outcome":true}`)}},
+		{name: "trailing bytes", event: chain.Event{Kind: "market_resolved", Data: []byte(`{"market_id":"0x0000000000000000000000000000000000000000000000000000000000000000","outcome":true}x`)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := DecodeEvent(tt.event); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("DecodeEvent = %v, want ErrInvalidEvent", err)
+			}
+		})
 	}
 }
 

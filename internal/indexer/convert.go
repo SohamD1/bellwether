@@ -2,10 +2,12 @@
 package indexer
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"sort"
 
@@ -39,6 +41,28 @@ type liquidityPayload struct {
 type resolvedPayload struct {
 	MarketID string `json:"market_id"`
 	Outcome  bool   `json:"outcome"`
+}
+
+type decodedTradePayload struct {
+	MarketID       string  `json:"market_id"`
+	Trader         string  `json:"trader"`
+	Yes            *bool   `json:"yes"`
+	Amount         string  `json:"amount"`
+	YesReserve     string  `json:"yes_reserve"`
+	NoReserve      string  `json:"no_reserve"`
+	ResolutionTime *uint64 `json:"resolution_time"`
+}
+
+type decodedLiquidityPayload struct {
+	MarketID       string  `json:"market_id"`
+	YesReserve     string  `json:"yes_reserve"`
+	NoReserve      string  `json:"no_reserve"`
+	ResolutionTime *uint64 `json:"resolution_time"`
+}
+
+type decodedResolvedPayload struct {
+	MarketID string `json:"market_id"`
+	Outcome  *bool  `json:"outcome"`
 }
 
 // ConvertEvent serializes one decoded fixture event into a stable, versionable
@@ -102,6 +126,136 @@ func ConvertEvent(event market.Event) (chain.Event, error) {
 	return chain.Event{Kind: kind, Data: data}, nil
 }
 
+// DecodeEvent reconstructs one typed fixture event from its canonical
+// chain-event payload without requiring the original RPC log.
+func DecodeEvent(event chain.Event) (market.Event, error) {
+	switch event.Kind {
+	case "trade":
+		var payload decodedTradePayload
+		if err := decodePayload(event.Data, &payload); err != nil {
+			return nil, err
+		}
+		marketID, err := hashFromHex("market ID", payload.MarketID)
+		if err != nil {
+			return nil, err
+		}
+		trader, err := addressFromHex(payload.Trader)
+		if err != nil {
+			return nil, err
+		}
+		amount, err := decimalUint256("amount", payload.Amount)
+		if err != nil {
+			return nil, err
+		}
+		yesReserve, err := decimalUint256("yes reserve", payload.YesReserve)
+		if err != nil {
+			return nil, err
+		}
+		noReserve, err := decimalUint256("no reserve", payload.NoReserve)
+		if err != nil {
+			return nil, err
+		}
+		if payload.Yes == nil || payload.ResolutionTime == nil {
+			return nil, fmt.Errorf("%w: trade is missing required fields", ErrInvalidEvent)
+		}
+		return market.Trade{
+			MarketID: marketID, Trader: trader, Yes: *payload.Yes, Amount: amount,
+			YesReserve: yesReserve, NoReserve: noReserve, ResolutionTime: *payload.ResolutionTime,
+		}, nil
+	case "liquidity_changed":
+		var payload decodedLiquidityPayload
+		if err := decodePayload(event.Data, &payload); err != nil {
+			return nil, err
+		}
+		marketID, err := hashFromHex("market ID", payload.MarketID)
+		if err != nil {
+			return nil, err
+		}
+		yesReserve, err := decimalUint256("yes reserve", payload.YesReserve)
+		if err != nil {
+			return nil, err
+		}
+		noReserve, err := decimalUint256("no reserve", payload.NoReserve)
+		if err != nil {
+			return nil, err
+		}
+		if payload.ResolutionTime == nil {
+			return nil, fmt.Errorf("%w: liquidity change is missing resolution time", ErrInvalidEvent)
+		}
+		return market.LiquidityChanged{
+			MarketID: marketID, YesReserve: yesReserve, NoReserve: noReserve,
+			ResolutionTime: *payload.ResolutionTime,
+		}, nil
+	case "market_resolved":
+		var payload decodedResolvedPayload
+		if err := decodePayload(event.Data, &payload); err != nil {
+			return nil, err
+		}
+		marketID, err := hashFromHex("market ID", payload.MarketID)
+		if err != nil {
+			return nil, err
+		}
+		if payload.Outcome == nil {
+			return nil, fmt.Errorf("%w: resolution is missing outcome", ErrInvalidEvent)
+		}
+		return market.MarketResolved{MarketID: marketID, Outcome: *payload.Outcome}, nil
+	default:
+		return nil, fmt.Errorf("%w: unsupported kind %q", ErrInvalidEvent, event.Kind)
+	}
+}
+
+func decodePayload(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return fmt.Errorf("%w: decode payload: %v", ErrInvalidEvent, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: trailing payload value", ErrInvalidEvent)
+	}
+	return nil
+}
+
+func hashFromHex(field, value string) (base.Hash, error) {
+	decoded, err := fixedHex(field, value, len(base.Hash{}))
+	if err != nil {
+		return base.Hash{}, err
+	}
+	var result base.Hash
+	copy(result[:], decoded)
+	return result, nil
+}
+
+func addressFromHex(value string) (base.Address, error) {
+	decoded, err := fixedHex("trader", value, len(base.Address{}))
+	if err != nil {
+		return base.Address{}, err
+	}
+	var result base.Address
+	copy(result[:], decoded)
+	return result, nil
+}
+
+func fixedHex(field, value string, size int) ([]byte, error) {
+	if len(value) != 2+size*2 || len(value) < 2 || value[:2] != "0x" {
+		return nil, fmt.Errorf("%w: %s is not %d-byte hex", ErrInvalidEvent, field, size)
+	}
+	decoded, err := hex.DecodeString(value[2:])
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s is not hex", ErrInvalidEvent, field)
+	}
+	return decoded, nil
+}
+
+func decimalUint256(field, value string) (*big.Int, error) {
+	integer, ok := new(big.Int).SetString(value, 10)
+	if !ok || integer.Sign() < 0 || integer.BitLen() > 256 || integer.String() != value {
+		return nil, fmt.Errorf("%w: %s is not canonical uint256", ErrInvalidEvent, field)
+	}
+	return integer, nil
+}
+
 func uint256Decimal(field string, value *big.Int) (string, error) {
 	if value == nil || value.Sign() < 0 || value.BitLen() > 256 {
 		return "", fmt.Errorf("%w: %s is not uint256", ErrInvalidEvent, field)
@@ -144,13 +298,12 @@ func (c *Coordinator) convertBlock(header *types.Header, logs []base.Log) (chain
 		if err != nil {
 			return chain.Block{}, fmt.Errorf("indexer: convert block %d log %d: %w", number, log.Index, err)
 		}
+		event.LogIndex = uint64(log.Index)
 		events = append(events, event)
 	}
 	return chain.Block{
-		Number: number,
-		Hash:   chain.Hash(hash),
-		Parent: chain.Hash(header.ParentHash),
-		Events: events,
+		Number: number, Hash: chain.Hash(hash), Parent: chain.Hash(header.ParentHash),
+		Timestamp: header.Time, Events: events,
 	}, nil
 }
 

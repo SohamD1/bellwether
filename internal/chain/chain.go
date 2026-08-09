@@ -9,17 +9,19 @@ type Hash [32]byte
 
 // Event is one occurrence observed inside a block.
 type Event struct {
-	Kind string
-	Data []byte
+	Kind     string
+	Data     []byte
+	LogIndex uint64
 }
 
 // Block is a chain block and the events observed in it. Events are held by
 // the block so that dropping a block drops its events with it.
 type Block struct {
-	Number uint64
-	Hash   Hash
-	Parent Hash
-	Events []Event
+	Number    uint64
+	Hash      Hash
+	Parent    Hash
+	Timestamp uint64
+	Events    []Event
 }
 
 // ErrNotLinear reports a block that neither extends the tip nor is already

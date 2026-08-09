@@ -4,11 +4,14 @@ version = "0.1.0"
 description = "Walk-forward training and evaluation harness for Bellwether"
 requires-python = ">=3.12"
 dependencies = [
-    "lightgbm>=4.6",
+    "lightgbm>=4.6,<5",
     "numpy>=2.2",
     "pyarrow>=19",
     "scikit-learn>=1.6",
 ]
+
+[project.scripts]
+bellwether-experiment = "bellwether_harness.experiment:main"
 
 [dependency-groups]
 dev = [
