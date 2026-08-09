@@ -64,6 +64,12 @@ func (s *LiveSubscriber) Run(ctx context.Context, emit func(Log) error) error {
 		}
 		return fmt.Errorf("base: subscribe filter logs: %w", err)
 	}
+	if subscription == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return errors.New("base: subscribe filter logs: nil subscription")
+	}
 	defer subscription.Unsubscribe()
 	subscriptionErrors := subscription.Err()
 
@@ -75,27 +81,94 @@ func (s *LiveSubscriber) Run(ctx context.Context, emit func(Log) error) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err, ok := <-subscriptionErrors:
+			if !ok {
+				err = nil
+			}
+			return finishSubscription(ctx, logs, subscriptionErrors, emit, err)
+		case log, ok := <-logs:
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			if !ok || err == nil {
-				return ErrSubscriptionClosed
+			if !ok {
+				return finishSubscription(ctx, logs, subscriptionErrors, emit, nil)
 			}
-			return fmt.Errorf("base: live log subscription: %w", err)
+			if err := emitLiveLog(ctx, emit, log); err != nil {
+				return err
+			}
+			select {
+			case err, ok := <-subscriptionErrors:
+				if !ok {
+					err = nil
+				}
+				return finishSubscription(ctx, logs, subscriptionErrors, emit, err)
+			default:
+			}
+		}
+	}
+}
+
+func finishSubscription(
+	ctx context.Context,
+	logs <-chan types.Log,
+	subscriptionErrors <-chan error,
+	emit func(Log) error,
+	terminalErr error,
+) error {
+	buffered := len(logs)
+	for i := 0; i < buffered; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case log, ok := <-logs:
+			if !ok {
+				break
+			}
+			if err := emitLiveLog(ctx, emit, log); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if terminalErr != nil {
+		return fmt.Errorf("base: live log subscription: %w", terminalErr)
+	}
+
+	readyErrors := len(subscriptionErrors) + 1
+	for i := 0; i < readyErrors; i++ {
+		select {
+		case err, ok := <-subscriptionErrors:
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
 			if !ok {
 				return ErrSubscriptionClosed
 			}
-			emitErr := emit(logFromRPC(log))
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+			if err != nil {
+				return fmt.Errorf("base: live log subscription: %w", err)
 			}
-			if emitErr != nil {
-				return fmt.Errorf("base: emit live log: %w", emitErr)
-			}
+		default:
+			return ErrSubscriptionClosed
 		}
 	}
+	return ErrSubscriptionClosed
+}
+
+func emitLiveLog(ctx context.Context, emit func(Log) error, log types.Log) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	emitErr := emit(logFromRPC(log))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if emitErr != nil {
+		return fmt.Errorf("base: emit live log: %w", emitErr)
+	}
+	return nil
 }

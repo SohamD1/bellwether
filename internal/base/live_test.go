@@ -23,9 +23,10 @@ func (c *fakeLiveClient) SubscribeFilterLogs(ctx context.Context, query ethereum
 }
 
 type fakeSubscription struct {
-	errs         chan error
-	unsubscribed chan struct{}
-	once         sync.Once
+	errs             chan error
+	unsubscribed     chan struct{}
+	unsubscribeCalls int
+	once             sync.Once
 }
 
 func newFakeSubscription() *fakeSubscription {
@@ -40,6 +41,7 @@ func (s *fakeSubscription) Err() <-chan error {
 }
 
 func (s *fakeSubscription) Unsubscribe() {
+	s.unsubscribeCalls++
 	s.once.Do(func() { close(s.unsubscribed) })
 }
 
@@ -49,6 +51,9 @@ func assertUnsubscribed(t *testing.T, subscription *fakeSubscription) {
 	case <-subscription.unsubscribed:
 	default:
 		t.Fatal("subscription was not unsubscribed")
+	}
+	if got, want := subscription.unsubscribeCalls, 1; got != want {
+		t.Fatalf("Unsubscribe calls = %d, want %d", got, want)
 	}
 }
 
@@ -185,6 +190,21 @@ func TestLiveSubscriberReturnsSubscribeErrorWithContext(t *testing.T) {
 	}
 }
 
+func TestLiveSubscriberRejectsNilSubscriptionWithContext(t *testing.T) {
+	client := &fakeLiveClient{subscribe: func(context.Context, ethereum.FilterQuery, chan<- types.Log) (ethereum.Subscription, error) {
+		return nil, nil
+	}}
+	subscriber, err := NewLiveSubscriber(client, liveConfig(1))
+	if err != nil {
+		t.Fatalf("NewLiveSubscriber: %v", err)
+	}
+
+	err = subscriber.Run(context.Background(), func(Log) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "subscribe filter logs") || !strings.Contains(err.Error(), "nil subscription") {
+		t.Fatalf("Run = %v, want contextual nil subscription error", err)
+	}
+}
+
 func TestLiveSubscriberReturnsSubscriptionErrorWithContextAndUnsubscribes(t *testing.T) {
 	wantErr := errors.New("subscription failed")
 	subscription := newFakeSubscription()
@@ -253,6 +273,104 @@ func TestLiveSubscriberReturnsClosedErrorChannelAndUnsubscribes(t *testing.T) {
 		t.Fatalf("Run = %v, want ErrSubscriptionClosed", err)
 	}
 	assertUnsubscribed(t, subscription)
+}
+
+func TestLiveSubscriberReturnsNilSubscriptionErrorAndUnsubscribes(t *testing.T) {
+	subscription := newFakeSubscription()
+	subscription.errs <- nil
+	client := &fakeLiveClient{subscribe: func(context.Context, ethereum.FilterQuery, chan<- types.Log) (ethereum.Subscription, error) {
+		return subscription, nil
+	}}
+	subscriber, err := NewLiveSubscriber(client, liveConfig(1))
+	if err != nil {
+		t.Fatalf("NewLiveSubscriber: %v", err)
+	}
+
+	if err := subscriber.Run(context.Background(), func(Log) error { return nil }); !errors.Is(err, ErrSubscriptionClosed) {
+		t.Fatalf("Run = %v, want ErrSubscriptionClosed", err)
+	}
+	assertUnsubscribed(t, subscription)
+}
+
+func TestLiveSubscriberPrefersReadySubscriptionErrorToClosedLogs(t *testing.T) {
+	wantErr := errors.New("terminal subscription failure")
+	for attempt := 0; attempt < 64; attempt++ {
+		subscription := newFakeSubscription()
+		subscription.errs <- wantErr
+		close(subscription.errs)
+		client := &fakeLiveClient{subscribe: func(_ context.Context, _ ethereum.FilterQuery, logs chan<- types.Log) (ethereum.Subscription, error) {
+			close(logs)
+			return subscription, nil
+		}}
+		subscriber, err := NewLiveSubscriber(client, liveConfig(1))
+		if err != nil {
+			t.Fatalf("NewLiveSubscriber: %v", err)
+		}
+
+		err = subscriber.Run(context.Background(), func(Log) error { return nil })
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("attempt %d: Run = %v, want subscription error %v", attempt+1, err, wantErr)
+		}
+		assertUnsubscribed(t, subscription)
+	}
+}
+
+func TestLiveSubscriberDrainsBufferedLogsBeforeReadyTerminal(t *testing.T) {
+	wantErr := errors.New("terminal subscription failure")
+	tests := []struct {
+		name        string
+		terminate   func(*fakeSubscription)
+		wantRunErr  error
+		wantContext string
+	}{
+		{
+			name: "real subscription error",
+			terminate: func(subscription *fakeSubscription) {
+				subscription.errs <- wantErr
+			},
+			wantRunErr:  wantErr,
+			wantContext: "live log subscription",
+		},
+		{
+			name:       "closed subscription error channel",
+			terminate:  func(subscription *fakeSubscription) { close(subscription.errs) },
+			wantRunErr: ErrSubscriptionClosed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for attempt := 0; attempt < 16; attempt++ {
+				subscription := newFakeSubscription()
+				client := &fakeLiveClient{subscribe: func(_ context.Context, _ ethereum.FilterQuery, logs chan<- types.Log) (ethereum.Subscription, error) {
+					for block := uint64(1); block <= 4; block++ {
+						logs <- types.Log{BlockNumber: block}
+					}
+					tt.terminate(subscription)
+					return subscription, nil
+				}}
+				subscriber, err := NewLiveSubscriber(client, liveConfig(4))
+				if err != nil {
+					t.Fatalf("NewLiveSubscriber: %v", err)
+				}
+
+				var emitted []uint64
+				err = subscriber.Run(context.Background(), func(log Log) error {
+					emitted = append(emitted, log.BlockNumber)
+					return nil
+				})
+				if !errors.Is(err, tt.wantRunErr) {
+					t.Fatalf("attempt %d: Run = %v, want %v", attempt+1, err, tt.wantRunErr)
+				}
+				if tt.wantContext != "" && !strings.Contains(err.Error(), tt.wantContext) {
+					t.Fatalf("attempt %d: Run = %v, want context %q", attempt+1, err, tt.wantContext)
+				}
+				if want := []uint64{1, 2, 3, 4}; !reflect.DeepEqual(emitted, want) {
+					t.Fatalf("attempt %d: emitted blocks = %v, want %v", attempt+1, emitted, want)
+				}
+				assertUnsubscribed(t, subscription)
+			}
+		})
+	}
 }
 
 func TestLiveSubscriberReturnsPreCanceledContextWithoutSubscribing(t *testing.T) {
@@ -376,11 +494,15 @@ func TestLiveSubscriberBackpressuresProducerAtConfiguredBound(t *testing.T) {
 
 	emitterEntered := make(chan struct{})
 	releaseEmitter := make(chan struct{})
-	thirdStarted := make(chan struct{})
+	probeResult := make(chan bool, 1)
+	allowBlockingSend := make(chan struct{})
+	blockingSendStarted := make(chan struct{})
 	thirdSent := make(chan struct{})
 	producerDone := make(chan struct{})
 	var releaseOnce sync.Once
+	var allowOnce sync.Once
 	defer func() { releaseOnce.Do(func() { close(releaseEmitter) }) }()
+	defer func() { allowOnce.Do(func() { close(allowBlockingSend) }) }()
 
 	subscription := newFakeSubscription()
 	client := &fakeLiveClient{subscribe: func(_ context.Context, _ ethereum.FilterQuery, logs chan<- types.Log) (ethereum.Subscription, error) {
@@ -388,7 +510,23 @@ func TestLiveSubscriberBackpressuresProducerAtConfiguredBound(t *testing.T) {
 			defer close(producerDone)
 			logs <- types.Log{BlockNumber: 1}
 			logs <- types.Log{BlockNumber: 2}
-			close(thirdStarted)
+			probeSucceeded := false
+			select {
+			case logs <- types.Log{BlockNumber: 3}:
+				probeSucceeded = true
+			default:
+			}
+			probeResult <- probeSucceeded
+			if probeSucceeded {
+				<-ctx.Done()
+				return
+			}
+			select {
+			case <-allowBlockingSend:
+			case <-ctx.Done():
+				return
+			}
+			close(blockingSendStarted)
 			select {
 			case logs <- types.Log{BlockNumber: 3}:
 				close(thirdSent)
@@ -421,12 +559,16 @@ func TestLiveSubscriberBackpressuresProducerAtConfiguredBound(t *testing.T) {
 	}()
 
 	waitForSignal(t, emitterEntered, "emitter to receive first log")
-	waitForSignal(t, thirdStarted, "producer to attempt third log")
 	select {
-	case <-thirdSent:
-		t.Fatal("third send completed while emitter was blocked and one-slot queue was full")
-	default:
+	case probeSucceeded := <-probeResult:
+		if probeSucceeded {
+			t.Fatal("nonblocking third send succeeded while emitter was blocked and one-slot queue was full")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for nonblocking send probe")
 	}
+	allowOnce.Do(func() { close(allowBlockingSend) })
+	waitForSignal(t, blockingSendStarted, "producer to start blocking third send")
 	releaseOnce.Do(func() { close(releaseEmitter) })
 	waitForSignal(t, thirdSent, "third send after emitter release")
 
