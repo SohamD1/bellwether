@@ -37,8 +37,8 @@ func ranges(queries []ethereum.FilterQuery) []queryRange {
 
 func config(from, to, minRange, maxRange uint64) BackfillConfig {
 	return BackfillConfig{
-		Address:   common.HexToAddress("0x100"),
-		Topics:    [][]common.Hash{{common.HexToHash("0x200")}},
+		Address:   Address(common.HexToAddress("0x100")),
+		Topics:    [][]Hash{{Hash(common.HexToHash("0x200"))}},
 		FromBlock: from,
 		ToBlock:   to,
 		MinRange:  minRange,
@@ -61,7 +61,7 @@ func TestBackfillRequestsAscendingInclusiveRanges(t *testing.T) {
 		t.Fatalf("NewBackfiller: %v", err)
 	}
 
-	if err := backfiller.Backfill(context.Background(), func(types.Log) error { return nil }); err != nil {
+	if err := backfiller.Backfill(context.Background(), func(Log) error { return nil }); err != nil {
 		t.Fatalf("Backfill: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestBackfillShrinksAfterProviderErrorsAndRecoversAfterSuccess(t *testing.T)
 		t.Fatalf("NewBackfiller: %v", err)
 	}
 
-	if err := backfiller.Backfill(context.Background(), func(types.Log) error { return nil }); err != nil {
+	if err := backfiller.Backfill(context.Background(), func(Log) error { return nil }); err != nil {
 		t.Fatalf("Backfill: %v", err)
 	}
 
@@ -93,6 +93,28 @@ func TestBackfillShrinksAfterProviderErrorsAndRecoversAfterSuccess(t *testing.T)
 	}
 }
 
+func TestBackfillShrinksFromTailClampedRequestRange(t *testing.T) {
+	attempts := 0
+	client := &fakeClient{filter: func(_ context.Context, _ ethereum.FilterQuery) ([]types.Log, error) {
+		attempts++
+		if attempts <= 2 {
+			return nil, errors.New("provider range limit")
+		}
+		return nil, nil
+	}}
+	backfiller, err := NewBackfiller(client, config(100, 104, 1, 16))
+	if err != nil {
+		t.Fatalf("NewBackfiller: %v", err)
+	}
+
+	if err := backfiller.Backfill(context.Background(), func(Log) error { return nil }); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+
+	if got, want := ranges(client.queries), []queryRange{{100, 104}, {100, 101}, {100, 100}, {101, 102}, {103, 104}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("queried ranges = %v, want %v", got, want)
+	}
+}
 func TestBackfillEmitsLogsInBlockTransactionAndLogOrder(t *testing.T) {
 	client := &fakeClient{filter: func(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
 		if query.FromBlock.Cmp(big.NewInt(10)) == 0 {
@@ -113,7 +135,7 @@ func TestBackfillEmitsLogsInBlockTransactionAndLogOrder(t *testing.T) {
 	}
 
 	var got []string
-	err = backfiller.Backfill(context.Background(), func(log types.Log) error {
+	err = backfiller.Backfill(context.Background(), func(log Log) error {
 		got = append(got, string(log.Data))
 		return nil
 	})
@@ -125,11 +147,123 @@ func TestBackfillEmitsLogsInBlockTransactionAndLogOrder(t *testing.T) {
 	}
 }
 
+func TestBackfillCopiesCallerTopicsAtConstruction(t *testing.T) {
+	var seen common.Hash
+	client := &fakeClient{filter: func(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
+		seen = query.Topics[0][0]
+		return nil, nil
+	}}
+	cfg := config(10, 10, 1, 1)
+	want := common.Hash(cfg.Topics[0][0])
+	backfiller, err := NewBackfiller(client, cfg)
+	if err != nil {
+		t.Fatalf("NewBackfiller: %v", err)
+	}
+	cfg.Topics[0][0] = Hash(common.HexToHash("0xBAD"))
+
+	if err := backfiller.Backfill(context.Background(), func(Log) error { return nil }); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	if seen != want {
+		t.Fatalf("queried topic = %v, want original %v", seen, want)
+	}
+}
+
+func TestBackfillCopiesTopicsForEachClientQuery(t *testing.T) {
+	want := common.HexToHash("0x200")
+	var seen []common.Hash
+	client := &fakeClient{filter: func(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
+		seen = append(seen, query.Topics[0][0])
+		query.Topics[0][0] = common.HexToHash("0xBAD")
+		return nil, nil
+	}}
+	backfiller, err := NewBackfiller(client, config(10, 11, 1, 1))
+	if err != nil {
+		t.Fatalf("NewBackfiller: %v", err)
+	}
+
+	if err := backfiller.Backfill(context.Background(), func(Log) error { return nil }); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	if expected := []common.Hash{want, want}; !reflect.DeepEqual(seen, expected) {
+		t.Fatalf("queried topics = %v, want %v", seen, expected)
+	}
+}
+func TestBackfillMapsRPCLogToDomainLog(t *testing.T) {
+	rpcLog := types.Log{
+		Address:     common.HexToAddress("0x1234"),
+		Topics:      []common.Hash{common.HexToHash("0xA"), common.HexToHash("0xB")},
+		Data:        []byte{1, 2, 3},
+		BlockNumber: 42,
+		TxHash:      common.HexToHash("0xC"),
+		TxIndex:     3,
+		BlockHash:   common.HexToHash("0xD"),
+		Index:       4,
+		Removed:     true,
+	}
+	client := &fakeClient{filter: func(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
+		return []types.Log{rpcLog}, nil
+	}}
+	backfiller, err := NewBackfiller(client, config(42, 42, 1, 1))
+	if err != nil {
+		t.Fatalf("NewBackfiller: %v", err)
+	}
+
+	var got Log
+	if err := backfiller.Backfill(context.Background(), func(log Log) error {
+		got = log
+		return nil
+	}); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	want := Log{
+		Address:          Address(rpcLog.Address),
+		Topics:           []Hash{Hash(rpcLog.Topics[0]), Hash(rpcLog.Topics[1])},
+		Data:             []byte{1, 2, 3},
+		BlockNumber:      42,
+		TransactionHash:  Hash(rpcLog.TxHash),
+		TransactionIndex: 3,
+		BlockHash:        Hash(rpcLog.BlockHash),
+		Index:            4,
+		Removed:          true,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("emitted log = %+v, want %+v", got, want)
+	}
+}
+
+func TestBackfillDomainLogDoesNotAliasRPCLog(t *testing.T) {
+	rpcLogs := []types.Log{{
+		Topics: []common.Hash{common.HexToHash("0xA")},
+		Data:   []byte{1, 2, 3},
+	}}
+	client := &fakeClient{filter: func(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
+		return rpcLogs, nil
+	}}
+	backfiller, err := NewBackfiller(client, config(10, 10, 1, 1))
+	if err != nil {
+		t.Fatalf("NewBackfiller: %v", err)
+	}
+
+	if err := backfiller.Backfill(context.Background(), func(log Log) error {
+		log.Topics[0] = Hash{}
+		log.Data[0] = 0xFF
+		return nil
+	}); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+	if got, want := rpcLogs[0].Topics[0], common.HexToHash("0xA"); got != want {
+		t.Fatalf("RPC topic mutated to %v, want %v", got, want)
+	}
+	if got, want := rpcLogs[0].Data, []byte{1, 2, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("RPC data mutated to %v, want %v", got, want)
+	}
+}
 func TestNewBackfillerRejectsInvalidConfiguration(t *testing.T) {
 	valid := config(10, 20, 2, 4)
 	for name, mutate := range map[string]func(*BackfillConfig){
 		"nil client":            func(*BackfillConfig) {},
-		"zero address":          func(c *BackfillConfig) { c.Address = common.Address{} },
+		"zero address":          func(c *BackfillConfig) { c.Address = Address{} },
 		"empty topics":          func(c *BackfillConfig) { c.Topics = nil },
 		"reversed blocks":       func(c *BackfillConfig) { c.FromBlock, c.ToBlock = 21, 20 },
 		"zero minimum range":    func(c *BackfillConfig) { c.MinRange = 0 },
@@ -162,7 +296,7 @@ func TestBackfillReturnsCancellationWithoutQuerying(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := backfiller.Backfill(ctx, func(types.Log) error { return nil }); !errors.Is(err, context.Canceled) {
+	if err := backfiller.Backfill(ctx, func(Log) error { return nil }); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Backfill = %v, want context.Canceled", err)
 	}
 	if len(client.queries) != 0 {
@@ -170,6 +304,21 @@ func TestBackfillReturnsCancellationWithoutQuerying(t *testing.T) {
 	}
 }
 
+func TestBackfillReturnsCancellationAfterSuccessfulFinalQuery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &fakeClient{filter: func(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
+		cancel()
+		return nil, nil
+	}}
+	backfiller, err := NewBackfiller(client, config(10, 10, 1, 1))
+	if err != nil {
+		t.Fatalf("NewBackfiller: %v", err)
+	}
+
+	if err := backfiller.Backfill(ctx, func(Log) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Backfill = %v, want context.Canceled", err)
+	}
+}
 func TestBackfillStopsAtMinimumRangeAfterProviderError(t *testing.T) {
 	client := &fakeClient{filter: func(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
 		return nil, errProviderUnavailable
@@ -179,7 +328,7 @@ func TestBackfillStopsAtMinimumRangeAfterProviderError(t *testing.T) {
 		t.Fatalf("NewBackfiller: %v", err)
 	}
 
-	err = backfiller.Backfill(context.Background(), func(types.Log) error { return nil })
+	err = backfiller.Backfill(context.Background(), func(Log) error { return nil })
 	if err == nil || !errors.Is(err, errProviderUnavailable) {
 		t.Fatalf("Backfill = %v, want provider error", err)
 	}
