@@ -1,0 +1,45 @@
+commitForecast
+|-- when marketId is zero
+|   `-- it reverts with ZeroMarketId
+|-- when commitmentHash is zero
+|   `-- it reverts with ZeroCommitment
+|-- when resolutionTime is now or in the past
+|   `-- it reverts with InvalidResolutionTime
+|-- when the caller already committed for the market
+|   `-- it reverts with CommitmentAlreadyExists
+`-- when all inputs are valid
+    |-- it stores the exact hash, block, timestamp, resolution time, and unrevealed state
+    |-- it emits the exact ForecastCommitted fields
+    |-- it accepts the last future second
+    `-- it permits a different caller to commit for the same market
+
+revealForecast
+|-- when marketId is zero
+|   `-- it reverts with ZeroMarketId
+|-- when probabilityBps exceeds 10000
+|   `-- it reverts with ProbabilityOutOfRange
+|-- when the caller has no commitment for the market
+|   |-- another caller cannot reveal someone else's commitment
+|   `-- it reverts with CommitmentNotFound
+|-- when the forecast was already revealed
+|   `-- it reverts with AlreadyRevealed
+|-- when resolutionTime has not arrived
+|   `-- it reverts with RevealTooEarly
+|-- when any committed preimage field is wrong
+|   |-- wrong probability, modelRunId, salt, or committed resolution is rejected
+|   `-- fuzzed corruptions revert with CommitmentMismatch
+`-- when the preimage is valid and resolutionTime has arrived
+    |-- it accepts probabilities from 0 through 10000 bps
+    |-- it marks the commitment revealed without changing commit metadata
+    `-- it emits the exact ForecastRevealed fields
+
+computeCommitment
+|-- when called with a forecast preimage
+|   |-- it equals keccak256(abi.encode(address(this), chainid, caller, market, resolution, probability, run, salt))
+|   `-- another registry address produces another commitment
+
+value surface
+|-- when ETH is sent with empty calldata
+|   `-- it rejects the transfer
+`-- when ETH is sent to any state-changing or read-only function
+    `-- every call rejects the transfer and the registry balance stays zero
