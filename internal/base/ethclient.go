@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 // ErrInvalidEthClient reports a missing RPC backend.
@@ -16,6 +17,13 @@ var ErrInvalidEthClient = errors.New("base: invalid eth client")
 // HeaderClient is the narrow read surface used to assemble canonical blocks.
 type HeaderClient interface {
 	HeaderByNumber(context.Context, *big.Int) (*types.Header, error)
+}
+
+// FinalityHeaderClient is the narrow RPC surface for Base safe and finalized
+// checkpoint headers.
+type FinalityHeaderClient interface {
+	SafeHeader(context.Context) (*types.Header, error)
+	FinalizedHeader(context.Context) (*types.Header, error)
 }
 
 // HeadSubscriptionClient is the narrow WebSocket surface used to drive live
@@ -74,6 +82,17 @@ func (c *EthClient) HeaderByNumber(ctx context.Context, number *big.Int) (*types
 	return c.backend.HeaderByNumber(ctx, number)
 }
 
+// SafeHeader asks the provider for the canonical safe checkpoint using the
+// block tag encoding understood by go-ethereum's ethclient.
+func (c *EthClient) SafeHeader(ctx context.Context) (*types.Header, error) {
+	return c.backend.HeaderByNumber(ctx, big.NewInt(rpc.SafeBlockNumber.Int64()))
+}
+
+// FinalizedHeader asks the provider for the canonical finalized checkpoint.
+func (c *EthClient) FinalizedHeader(ctx context.Context) (*types.Header, error) {
+	return c.backend.HeaderByNumber(ctx, big.NewInt(rpc.FinalizedBlockNumber.Int64()))
+}
+
 // SubscribeNewHead delegates one bounded live header subscription.
 func (c *EthClient) SubscribeNewHead(ctx context.Context, heads chan<- *types.Header) (ethereum.Subscription, error) {
 	return c.backend.SubscribeNewHead(ctx, heads)
@@ -88,5 +107,6 @@ var (
 	_ LogClient              = (*EthClient)(nil)
 	_ SubscriptionClient     = (*EthClient)(nil)
 	_ HeaderClient           = (*EthClient)(nil)
+	_ FinalityHeaderClient   = (*EthClient)(nil)
 	_ HeadSubscriptionClient = (*EthClient)(nil)
 )

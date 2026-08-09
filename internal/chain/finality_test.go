@@ -17,6 +17,51 @@ func finalitySeeded(t *testing.T) *Store {
 	return s
 }
 
+func TestMarkCheckpointsAppliesSafeAndFinalizedTogether(t *testing.T) {
+	t.Parallel()
+
+	s := finalitySeeded(t)
+	safeHash := h(4)
+	finalizedHash := h(2)
+	if err := s.MarkCheckpoints(&safeHash, &finalizedHash); err != nil {
+		t.Fatalf("MarkCheckpoints: %v", err)
+	}
+
+	safe, hasSafe := s.Checkpoint(FinalitySafe)
+	finalized, hasFinalized := s.Checkpoint(FinalityFinalized)
+	if !hasSafe || safe.Number != 103 || !hasFinalized || finalized.Number != 101 {
+		t.Fatalf("checkpoints = safe %+v/%v finalized %+v/%v, want 103 and 101", safe, hasSafe, finalized, hasFinalized)
+	}
+}
+
+func TestMarkCheckpointsRejectsFinalizedAboveSafeWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	s := finalitySeeded(t)
+	before := finalitySnapshotOf(s)
+	safeHash := h(3)
+	finalizedHash := h(4)
+
+	if err := s.MarkCheckpoints(&safeHash, &finalizedHash); !errors.Is(err, ErrInvalidCheckpointOrder) {
+		t.Fatalf("MarkCheckpoints = %v, want ErrInvalidCheckpointOrder", err)
+	}
+	assertFinalitySnapshot(t, s, before)
+}
+
+func TestMarkCheckpointsRejectsInvalidSecondUpdateWithoutPartialMutation(t *testing.T) {
+	t.Parallel()
+
+	s := finalitySeeded(t)
+	before := finalitySnapshotOf(s)
+	safeHash := h(4)
+	unknownFinalizedHash := h(99)
+
+	if err := s.MarkCheckpoints(&safeHash, &unknownFinalizedHash); !errors.Is(err, ErrUnknownBlock) {
+		t.Fatalf("MarkCheckpoints = %v, want ErrUnknownBlock", err)
+	}
+	assertFinalitySnapshot(t, s, before)
+}
+
 func TestMarkFinalityMovesCheckpointsForward(t *testing.T) {
 	s := finalitySeeded(t)
 
