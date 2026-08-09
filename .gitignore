@@ -26,3 +26,5 @@ Thumbs.db
 
 # Local agent worktrees
 .worktrees/
+
+.pytest-tmp/
