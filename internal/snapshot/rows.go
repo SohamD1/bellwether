@@ -19,6 +19,9 @@ var (
 	ErrRowOrder = errors.New("snapshot: row out of order")
 	// ErrMarketMismatch reports a row whose market differs from the first row.
 	ErrMarketMismatch = errors.New("snapshot: market mismatch")
+	// ErrTimestampRange reports a timestamp that cannot be represented exactly
+	// as a signed Unix nanosecond value.
+	ErrTimestampRange = errors.New("snapshot: timestamp outside Unix nanosecond range")
 )
 
 // parquetRow is the explicit, version-one on-disk schema. Timestamps are Unix
@@ -50,6 +53,9 @@ func validate(rows []features.Snapshot) error {
 		if row.Finality > chain.FinalityFinalized {
 			return fmt.Errorf("%w at row %d", chain.ErrInvalidFinality, i)
 		}
+		if !unixNanoRepresentable(row.BlockTimestamp) || !unixNanoRepresentable(row.ResolutionTime) {
+			return fmt.Errorf("%w at row %d", ErrTimestampRange, i)
+		}
 		if i > 0 && !positionAfter(row, rows[i-1]) {
 			return fmt.Errorf("%w at row %d", ErrRowOrder, i)
 		}
@@ -66,6 +72,11 @@ func validate(rows []features.Snapshot) error {
 		}
 	}
 	return nil
+}
+
+func unixNanoRepresentable(value time.Time) bool {
+	nanoseconds := value.UnixNano()
+	return time.Unix(0, nanoseconds).Equal(value)
 }
 
 func positionAfter(row, previous features.Snapshot) bool {
@@ -94,10 +105,13 @@ func toParquetRows(rows []features.Snapshot) []parquetRow {
 	return converted
 }
 
-func fromParquetRows(rows []parquetRow) []features.Snapshot {
+func fromParquetRows(rows []parquetRow) ([]features.Snapshot, error) {
 	converted := make([]features.Snapshot, len(rows))
 	for i := range rows {
 		row := rows[i]
+		if row.Finality < int32(chain.FinalitySeen) || row.Finality > int32(chain.FinalityFinalized) {
+			return nil, fmt.Errorf("%w at row %d", chain.ErrInvalidFinality, i)
+		}
 		converted[i] = features.Snapshot{
 			MarketID:                 row.MarketID,
 			BlockNumber:              row.BlockNumber,
@@ -112,5 +126,5 @@ func fromParquetRows(rows []parquetRow) []features.Snapshot {
 			BlockLag:                 row.BlockLag,
 		}
 	}
-	return converted
+	return converted, nil
 }

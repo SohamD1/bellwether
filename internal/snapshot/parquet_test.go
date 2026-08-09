@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -226,5 +227,54 @@ func assertNoTemporarySiblings(t *testing.T, dir, base string) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary siblings remain: %v", matches)
+	}
+}
+func TestWriteParquetRoundTripsUnixNanosecondBoundaries(t *testing.T) {
+	t.Parallel()
+
+	want := testRows()[:1]
+	want[0].BlockTimestamp = time.Unix(0, math.MinInt64).UTC()
+	want[0].ResolutionTime = time.Unix(0, math.MaxInt64).UTC()
+	path := filepath.Join(t.TempDir(), "boundaries.parquet")
+	if _, err := WriteParquet(path, want); err != nil {
+		t.Fatalf("WriteParquet: %v", err)
+	}
+	got, err := ReadParquet(path)
+	if err != nil {
+		t.Fatalf("ReadParquet: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadParquet() = %#v, want boundaries %#v", got, want)
+	}
+}
+
+func TestReadParquetRejectsRawFinalityBeforeNarrowing(t *testing.T) {
+	t.Parallel()
+
+	values := []int32{256, 257, 258, -254, -255, -256, -512}
+	for _, value := range values {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "malicious.parquet")
+			rows := []parquetRow{{
+				MarketID:                 "market-a",
+				BlockNumber:              1,
+				LogIndex:                 1,
+				BlockTimestamp:           1,
+				ResolutionTimestamp:      2,
+				Finality:                 value,
+				YesImpliedProbability:    0.5,
+				RecentTradeFlowImbalance: 0,
+				LiquidityDepth:           1,
+				SecondsToResolution:      1,
+				BlockLag:                 0,
+			}}
+			if err := parquet.WriteFile(path, rows); err != nil {
+				t.Fatalf("write malicious Parquet fixture: %v", err)
+			}
+			if _, err := ReadParquet(path); !errors.Is(err, chain.ErrInvalidFinality) {
+				t.Fatalf("ReadParquet finality %d error = %v, want ErrInvalidFinality", value, err)
+			}
+		})
 	}
 }

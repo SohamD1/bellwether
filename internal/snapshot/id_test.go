@@ -3,6 +3,8 @@ package snapshot
 import (
 	"errors"
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -172,4 +174,66 @@ func mutateRows(rows []features.Snapshot, index int, mutate func(*features.Snaps
 	changed := append([]features.Snapshot(nil), rows...)
 	mutate(&changed[index])
 	return changed
+}
+func TestComputeIDMatchesCanonicalGoldenVector(t *testing.T) {
+	t.Parallel()
+
+	rows := []features.Snapshot{{
+		MarketID:                 "m",
+		BlockNumber:              1,
+		LogIndex:                 2,
+		BlockTimestamp:           time.Unix(-1, 500).UTC(),
+		ResolutionTime:           time.Unix(1, 250).UTC(),
+		Finality:                 chain.FinalitySafe,
+		YesImpliedProbability:    0.5,
+		RecentTradeFlowImbalance: -0.25,
+		LiquidityDepth:           16,
+		SecondsToResolution:      1.5,
+		BlockLag:                 3,
+	}}
+	const want = "2de7952beb17f84b97f5c3c8443185e266646c7cffe6fb7655bb20e5778b8ac4"
+
+	got, err := ComputeID(rows)
+	if err != nil {
+		t.Fatalf("ComputeID: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ComputeID() = %q, want canonical golden %q", got, want)
+	}
+}
+
+func TestComputeIDAndWriteParquetRejectUnrepresentableTimestamps(t *testing.T) {
+	t.Parallel()
+
+	minimum := time.Unix(0, math.MinInt64).UTC()
+	maximum := time.Unix(0, math.MaxInt64).UTC()
+	tests := []struct {
+		name   string
+		mutate func(*features.Snapshot)
+	}{
+		{name: "zero block timestamp", mutate: func(row *features.Snapshot) { row.BlockTimestamp = time.Time{} }},
+		{name: "zero resolution timestamp", mutate: func(row *features.Snapshot) { row.ResolutionTime = time.Time{} }},
+		{name: "block timestamp one nanosecond below minimum", mutate: func(row *features.Snapshot) { row.BlockTimestamp = minimum.Add(-time.Nanosecond) }},
+		{name: "block timestamp two nanoseconds below minimum", mutate: func(row *features.Snapshot) { row.BlockTimestamp = minimum.Add(-2 * time.Nanosecond) }},
+		{name: "resolution timestamp one nanosecond above maximum", mutate: func(row *features.Snapshot) { row.ResolutionTime = maximum.Add(time.Nanosecond) }},
+		{name: "resolution timestamp two nanoseconds above maximum", mutate: func(row *features.Snapshot) { row.ResolutionTime = maximum.Add(2 * time.Nanosecond) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rows := testRows()[:1]
+			tt.mutate(&rows[0])
+			if id, err := ComputeID(rows); !errors.Is(err, ErrTimestampRange) {
+				t.Fatalf("ComputeID() = %q, %v, want ErrTimestampRange", id, err)
+			}
+			path := filepath.Join(t.TempDir(), "invalid.parquet")
+			if id, err := WriteParquet(path, rows); !errors.Is(err, ErrTimestampRange) {
+				t.Fatalf("WriteParquet() = %q, %v, want ErrTimestampRange", id, err)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("destination after rejected write: %v, want not exist", err)
+			}
+		})
+	}
 }

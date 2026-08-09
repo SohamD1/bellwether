@@ -12,6 +12,8 @@ import (
 // WriteParquet validates rows, writes them to a temporary sibling, and replaces
 // path only after the complete Parquet file has been closed and synchronized.
 // It returns the logical data snapshot ID, which is independent of file bytes.
+// New and replacement snapshots retain os.CreateTemp's private 0600 mode
+// instead of inheriting permissions from an existing destination.
 func WriteParquet(path string, rows []features.Snapshot) (string, error) {
 	id, err := ComputeID(rows)
 	if err != nil {
@@ -55,7 +57,10 @@ func ReadParquet(path string) ([]features.Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: read Parquet: %w", err)
 	}
-	converted := fromParquetRows(rows)
+	converted, err := fromParquetRows(rows)
+	if err != nil {
+		return nil, err
+	}
 	if err := validate(converted); err != nil {
 		return nil, err
 	}
