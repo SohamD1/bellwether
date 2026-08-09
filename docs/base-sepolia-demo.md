@@ -30,7 +30,7 @@ Base Sepolia uses chain ID `84532`, public RPC `https://sepolia.base.org`, and e
 Import the deployer into Foundry's encrypted keystore once. `cast` prompts securely for the key and an encryption password; never put a private key in a command, shell variable, `.env` file, or repository file.
 
 ```powershell
-cast wallet import bellwether-base-sepolia
+cast wallet import bellwether-base-sepolia --interactive
 ```
 
 Set `DEPLOYER_ADDRESS` below to the address of that account. From `contracts`, dry-run the exact deployment without submitting transactions:
