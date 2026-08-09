@@ -1,0 +1,61 @@
+createMarket
+|-- when marketId is zero
+|   `-- it reverts with ZeroMarketId
+|-- when either reserve is zero
+|   `-- it reverts with ZeroReserve
+|-- when resolutionTime is not in the future
+|   `-- it reverts with InvalidResolutionTime
+|-- when marketId already exists
+|   `-- it reverts with MarketAlreadyExists
+`-- when all inputs are valid
+    |-- it stores the market and emits the exact initial LiquidityChanged fields
+    `-- it stores reserves above uint64 without truncation
+
+setLiquidity
+|-- when marketId is zero
+|   `-- it reverts with ZeroMarketId
+|-- when either reserve is zero
+|   `-- it reverts with ZeroReserve
+|-- when marketId does not exist
+|   `-- it reverts with MarketNotFound
+|-- when the market is resolved
+|   `-- it reverts with MarketAlreadyResolved
+|-- when resolutionTime has arrived
+|   `-- it reverts with MarketClosed
+`-- when the market is open
+    `-- it stores both reserves and emits the exact LiquidityChanged fields
+
+recordTrade
+|-- when marketId is zero
+|   `-- it reverts with ZeroMarketId
+|-- when amount is zero
+|   `-- it reverts with ZeroAmount
+|-- when either resulting reserve is zero
+|   `-- it reverts with ZeroReserve
+|-- when marketId does not exist
+|   `-- it reverts with MarketNotFound
+|-- when the market is resolved
+|   `-- it reverts with MarketAlreadyResolved
+|-- when resolutionTime has arrived
+|   `-- it reverts with MarketClosed
+`-- when the market is open
+    |-- it stores both resulting reserves and emits the exact Trade fields
+    `-- it preserves amounts and reserves above uint64 without truncation
+
+resolveMarket
+|-- when marketId is zero
+|   `-- it reverts with ZeroMarketId
+|-- when marketId does not exist
+|   `-- it reverts with MarketNotFound
+|-- when the market is already resolved
+|   `-- it reverts with MarketAlreadyResolved
+|-- when resolutionTime has not arrived
+|   `-- it reverts with ResolutionPending
+`-- when resolutionTime has arrived
+    `-- it stores the outcome and emits the exact MarketResolved fields
+
+value surface
+|-- when ETH is sent with empty calldata
+|   `-- it rejects the transfer
+`-- when ETH is sent to any fixture function
+    `-- every call rejects the transfer and the fixture balance stays zero
