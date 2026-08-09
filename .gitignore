@@ -28,3 +28,9 @@ Thumbs.db
 .worktrees/
 
 .pytest-tmp/
+
+# Foundry
+/contracts/lib/
+/contracts/cache/
+/contracts/out/
+/contracts/broadcast/
