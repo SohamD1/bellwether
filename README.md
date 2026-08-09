@@ -123,7 +123,7 @@ These are local microbenchmark observations, not a latency guarantee.
 | Suite | Result |
 | --- | --- |
 | Go | 183 top-level tests passed across 12 packages; 430 pass events including subtests |
-| Python | 56 passed |
+| Python | 57 passed |
 | Solidity | not counted locally because `forge` was unavailable; CI installs pinned Foundry and runs `forge test` |
 
 CI also runs Go vet, formatting and lint checks, Go race tests, and the Solidity suite.
